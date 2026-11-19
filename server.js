@@ -13,7 +13,8 @@ const anthropic = new Anthropic({
 app.post('/api/chat', async (req, res) => {
   const { messages, model } = req.body;
   const selectedModel = model || 'claude-sonnet-5';
-
+  console.log('本次请求使用模型:', selectedModel);
+ 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
