@@ -10,17 +10,17 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// 关键：把前端代号映射到你接口里真实可用的模型名
+// 按文档里的规范模型 ID 做映射（如果某个 ID 在你账号下报 404，就换成另一个文档里列出的可用 ID）
 const MODEL_MAP = {
-  'o5.5': 'claude-sonnet-4-5',
-  'f5.2': 'claude-sonnet-4-5',
-  'f5.1': 'claude-haiku-4-5',
-  'f5': 'claude-haiku-4-5',
-  'o5': 'claude-opus-4-5',
-  'o4.6': 'claude-sonnet-4-5',
+  'o5.5': 'claude-sonnet-4-6',
+  'f5.2': 'claude-sonnet-4-6',
+  'f5.1': 'claude-haiku-4-5-20251001',
+  'f5': 'claude-haiku-4-5-20251001',
+  'o5': 'claude-opus-4-6',
+  'o4.6': 'claude-sonnet-4-6',
 };
 
-const FALLBACK_MODEL = 'claude-sonnet-4-5';
+const FALLBACK_MODEL = 'claude-sonnet-4-6';
 
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, status: 'running' });
