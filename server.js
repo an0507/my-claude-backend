@@ -39,9 +39,10 @@ app.post('/api/chat', async (req, res) => {
     // 结束信号
     res.write('data: [DONE]\n\n');
     res.end();
-  } catch (err) {
+      } catch (err) {
     console.error(err);
-    res.write(`data: ${JSON.stringify({ error: '出错了，请稍后再试' })}\n\n`);
+    const msg = err?.message || '出错了，请稍后再试';
+    res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
     res.end();
   }
 });
