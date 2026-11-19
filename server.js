@@ -11,7 +11,8 @@ const anthropic = new Anthropic({
 });
 
 app.post('/api/chat', async (req, res) => {
-  const { messages } = req.body;
+  const { messages, model } = req.body;
+  const selectedModel = model || 'claude-sonnet-5';
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -19,7 +20,7 @@ app.post('/api/chat', async (req, res) => {
 
   try {
     const stream = await anthropic.messages.stream({
-      model: 'claude-sonnet-5',
+      model: selectedModel,
       max_tokens: 1024,
       messages,
     });
