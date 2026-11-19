@@ -10,6 +10,18 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// 把前端显示的模型代号映射为接口实际可用的模型名（按你账号可用模型调整）
+const MODEL_MAP = {
+  'o5.5': 'claude-sonnet-4-5',
+  'f5.2': 'claude-sonnet-4-5',
+  'f5.1': 'claude-haiku-4-5',
+  'f5': 'claude-haiku-4-5',
+  'o5': 'claude-opus-4-5',
+  'o4.6': 'claude-sonnet-4-5',
+};
+
+const DEFAULT_REAL_MODEL = 'claude-sonnet-4-5';
+
 // 【新增 1】健康检查接口：放在 /api/chat 之前
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -23,13 +35,10 @@ function validateChatRequest(body) {
   if (!body || typeof body !== 'object') {
     return '请求体格式不正确';
   }
-
   const { messages, model } = body;
-
   if (!Array.isArray(messages) || messages.length === 0) {
     return 'messages 必须是非空数组';
   }
-
   for (let i = 0; i < messages.length; i += 1) {
     const item = messages[i];
     if (!item || typeof item !== 'object') {
@@ -42,11 +51,9 @@ function validateChatRequest(body) {
       return `第 ${i + 1} 条消息的 content 不能为空`;
     }
   }
-
   if (model !== undefined && (typeof model !== 'string' || model.trim() === '')) {
     return 'model 必须为非空字符串';
   }
-
   return null;
 }
 
@@ -58,8 +65,9 @@ app.post('/api/chat', async (req, res) => {
   }
 
   const { messages, model } = req.body;
-  const selectedModel = (model && model.trim()) || 'claude-sonnet-5';
-  console.log('本次请求使用模型:', selectedModel);
+  const requestedKey = (model && model.trim()) || '';
+  const selectedModel = MODEL_MAP[requestedKey] || DEFAULT_REAL_MODEL;
+  console.log('前端传入模型:', requestedKey || '(空)', '-> 实际请求模型:', selectedModel);
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
