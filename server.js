@@ -10,7 +10,7 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// 把前端显示的模型代号映射为接口实际可用的模型名（按你账号可用模型调整）
+// 关键：把前端代号映射到你接口里真实可用的模型名
 const MODEL_MAP = {
   'o5.5': 'claude-sonnet-4-5',
   'f5.2': 'claude-sonnet-4-5',
@@ -20,54 +20,21 @@ const MODEL_MAP = {
   'o4.6': 'claude-sonnet-4-5',
 };
 
-const DEFAULT_REAL_MODEL = 'claude-sonnet-4-5';
+const FALLBACK_MODEL = 'claude-sonnet-4-5';
 
-// 【新增 1】健康检查接口：放在 /api/chat 之前
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    ok: true,
-    status: 'running',
-  });
+  res.status(200).json({ ok: true, status: 'running' });
 });
 
-// 【新增 2】基础请求校验函数
-function validateChatRequest(body) {
-  if (!body || typeof body !== 'object') {
-    return '请求体格式不正确';
-  }
-  const { messages, model } = body;
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return 'messages 必须是非空数组';
-  }
-  for (let i = 0; i < messages.length; i += 1) {
-    const item = messages[i];
-    if (!item || typeof item !== 'object') {
-      return `第 ${i + 1} 条消息格式无效`;
-    }
-    if (!['user', 'assistant'].includes(item.role)) {
-      return `第 ${i + 1} 条消息的 role 必须为 user 或 assistant`;
-    }
-    if (typeof item.content !== 'string' || item.content.trim() === '') {
-      return `第 ${i + 1} 条消息的 content 不能为空`;
-    }
-  }
-  if (model !== undefined && (typeof model !== 'string' || model.trim() === '')) {
-    return 'model 必须为非空字符串';
-  }
-  return null;
-}
-
 app.post('/api/chat', async (req, res) => {
-  // 【新增 3】先校验请求，再设置 SSE 响应头和请求模型
-  const validationError = validateChatRequest(req.body);
-  if (validationError) {
-    return res.status(400).json({ error: validationError });
+  const { messages, model } = req.body || {};
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages 必须是非空数组' });
   }
 
-  const { messages, model } = req.body;
-  const requestedKey = (model && model.trim()) || '';
-  const selectedModel = MODEL_MAP[requestedKey] || DEFAULT_REAL_MODEL;
-  console.log('前端传入模型:', requestedKey || '(空)', '-> 实际请求模型:', selectedModel);
+  const rawModel = typeof model === 'string' ? model.trim() : '';
+  const selectedModel = MODEL_MAP[rawModel] || FALLBACK_MODEL;
+  console.log('收到模型:', rawModel || '(空)', '-> 实际请求:', selectedModel);
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
