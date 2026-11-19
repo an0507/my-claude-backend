@@ -4,7 +4,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -27,14 +27,27 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
-  const { messages, model } = req.body || {};
+  const { messages, model, system, maxTokens } = req.body || {};
+
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages 必须是非空数组' });
   }
 
   const rawModel = typeof model === 'string' ? model.trim() : '';
-  const selectedModel = MODEL_MAP[rawModel] || FALLBACK_MODEL;
-  console.log('收到模型:', rawModel || '(空)', '-> 实际请求:', selectedModel);
+  const selectedModel = MODEL_MAP[rawModel] || rawModel || FALLBACK_MODEL;
+  const resolvedMaxTokens =
+    typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 1024;
+  const systemPrompt =
+    typeof system === 'string' && system.trim() ? system.trim() : undefined;
+
+  console.log(
+    '收到模型:',
+    rawModel || '(空)',
+    '-> 实际请求:',
+    selectedModel,
+    '| 是否带 system:',
+    Boolean(systemPrompt)
+  );
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -43,7 +56,8 @@ app.post('/api/chat', async (req, res) => {
   try {
     const stream = await anthropic.messages.stream({
       model: selectedModel,
-      max_tokens: 1024,
+      max_tokens: resolvedMaxTokens,
+      ...(systemPrompt ? { system: systemPrompt } : {}),
       messages,
     });
 
