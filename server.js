@@ -6,27 +6,45 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const PROVIDER = (process.env.PROVIDER || 'qimingx').toLowerCase();
 
-// 按文档里的规范模型 ID 做映射（如果某个 ID 在你账号下报 404，就换成另一个文档里列出的可用 ID）
-const MODEL_MAP = {
-  'o5.5': 'claude-sonnet-4-6',
-  'f5.2': 'claude-sonnet-4-6',
-  'f5.1': 'claude-haiku-4-5-20251001',
-  'f5': 'claude-haiku-4-5-20251001',
-  'f5.0': 'claude-haiku-4-5-20251001',
-  'claude-fable-5-0': 'claude-haiku-4-5-20251001',
-  'claude-fable-5': 'claude-haiku-4-5-20251001',
-  'o5': 'claude-opus-4-6',
-  'o4.6': 'claude-sonnet-4-6',
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const QIMINGX_API_KEY = process.env.QIMINGX_API_KEY || process.env.OPENAI_API_KEY || '';
+const QIMINGX_BASE_URL =
+  process.env.QIMINGX_BASE_URL || 'https://api.qimingx.net/v1/chat/completions';
+
+const anthropic = ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
+  : null;
+
+// 按启明星模型广场里的实际模型 ID 映射（请替换为你确认可用的模型名）
+const QIMINGX_MODEL_MAP = {
+  'o5.5': '[摇光]gemini-3.5-flash',
+  'f5.2': '[摇光]gemini-3.5-flash',
+  'f5.1': '[摇光]gemini-3.5-flash',
+  'f5': '[摇光]gemini-3.5-flash',
+  'f5.0': '[摇光]gemini-3.5-flash',
+  'claude-fable-5-0': '[摇光]gemini-3.5-flash',
+  'claude-fable-5': '[摇光]gemini-3.5-flash',
+  'o5': '开阳-gemini-2.5-pro',
+  'o4.6': '开阳-gemini-2.5-pro',
 };
 
-const FALLBACK_MODEL = 'claude-sonnet-4-6';
+const QIMINGX_FALLBACK_MODEL = '[摇光]gemini-3.5-flash';
+
+function extractDeltaText(delta) {
+  if (!delta) return '';
+  if (typeof delta.content === 'string') return delta.content;
+  if (Array.isArray(delta.content)) {
+    return delta.content
+      .map((part) => (typeof part === 'string' ? part : part?.text || ''))
+      .join('');
+  }
+  return '';
+}
 
 app.get('/health', (req, res) => {
-  res.status(200).json({ ok: true, status: 'running' });
+  res.status(200).json({ ok: true, status: 'running', provider: PROVIDER });
 });
 
 app.post('/api/chat', async (req, res) => {
@@ -37,40 +55,117 @@ app.post('/api/chat', async (req, res) => {
   }
 
   const rawModel = typeof model === 'string' ? model.trim() : '';
-  const selectedModel = MODEL_MAP[rawModel] || rawModel || FALLBACK_MODEL;
   const resolvedMaxTokens =
-    typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 1024;
-  const systemPrompt =
-    typeof system === 'string' && system.trim() ? system.trim() : undefined;
-
-  console.log(
-    '收到模型:',
-    rawModel || '(空)',
-    '-> 实际请求:',
-    selectedModel,
-    '| 是否带 system:',
-    Boolean(systemPrompt)
-  );
+    typeof maxTokens === 'number' && maxTokens > 0 ? Math.min(maxTokens, 2048) : 800;
+  const systemPrompt = typeof system === 'string' && system.trim() ? system.trim() : '';
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
 
   try {
-    const stream = await anthropic.messages.stream({
-      model: selectedModel,
-      max_tokens: resolvedMaxTokens,
-      ...(systemPrompt ? { system: systemPrompt } : {}),
-      messages,
+    if (PROVIDER === 'anthropic') {
+      if (!anthropic) {
+        throw new Error('缺少 ANTHROPIC_API_KEY 环境变量');
+      }
+
+      const selectedModel = rawModel || 'claude-sonnet-4-5';
+      console.log('[anthropic] 模型:', selectedModel);
+
+      const stream = await anthropic.messages.create({
+        model: selectedModel,
+        max_tokens: resolvedMaxTokens,
+        ...(systemPrompt ? { system: systemPrompt } : {}),
+        messages,
+        stream: true,
+      });
+
+      for await (const event of stream) {
+        if (
+          event.type === 'content_block_delta' &&
+          event.delta &&
+          event.delta.type === 'text_delta'
+        ) {
+          res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
+        }
+      }
+
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
+    // 默认走启明星（OpenAI 兼容接口）
+    if (!QIMINGX_API_KEY) {
+      throw new Error('缺少 QIMINGX_API_KEY 环境变量');
+    }
+
+    const selectedModel =
+      QIMINGX_MODEL_MAP[rawModel] || rawModel || QIMINGX_FALLBACK_MODEL;
+    const formattedMessages = systemPrompt
+      ? [{ role: 'system', content: systemPrompt }, ...messages]
+      : messages;
+
+    console.log(
+      '[qimingx] 收到模型:',
+      rawModel || '(空)',
+      '-> 实际请求:',
+      selectedModel
+    );
+
+    const upstreamRes = await fetch(QIMINGX_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${QIMINGX_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: formattedMessages,
+        max_tokens: resolvedMaxTokens,
+        stream: true,
+      }),
     });
 
-    for await (const chunk of stream) {
-      if (
-        chunk.type === 'content_block_delta' &&
-        chunk.delta?.type === 'text_delta'
-      ) {
-        res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text();
+      throw new Error(`上游接口错误 ${upstreamRes.status}: ${errText}`);
+    }
+
+    const reader = upstreamRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let sentAnyText = false;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(payload);
+          const text =
+            extractDeltaText(parsed?.choices?.[0]?.delta) ||
+            parsed?.choices?.[0]?.message?.content ||
+            '';
+          if (text) {
+            sentAnyText = true;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          }
+        } catch (_) {}
       }
+    }
+
+    if (!sentAnyText) {
+      res.write(`data: ${JSON.stringify({ text: '' })}\n\n`);
     }
 
     res.write('data: [DONE]\n\n');
@@ -85,5 +180,5 @@ app.post('/api/chat', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`服务器已启动，端口 ${PORT}`);
+  console.log(`服务器已启动，端口 ${PORT}，当前通道: ${PROVIDER}`);
 });
