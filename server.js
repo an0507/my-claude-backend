@@ -4,7 +4,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '4mb' }));
 
 const PROVIDER = (process.env.PROVIDER || 'qimingx').toLowerCase();
 
@@ -19,7 +19,6 @@ const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
   : null;
 
-// 优先走日志中已成功接入的模型，避免先试多款模型导致超时
 const PRIMARY_CLAUDE_MODEL = '按量天狼星-claude-opus-4-8';
 
 const QIMINGX_FALLBACK_MODELS = [
@@ -79,12 +78,115 @@ async function fetchWithTimeout(url, options, timeoutMs = 25000) {
   }
 }
 
+/**
+ * 构建带缓存断点的结构：
+ * 1. Anthropic 官方 SDK：把 system 设为带 cache_control 的 block，并在倒数第二条历史消息挂断点
+ * 2. 启明星（OpenAI 兼容接口）：将稳定的 system 置顶，并附加 cache_control 提示（兼容不支持该字段的上游时不会报错）
+ */
+function buildCachedAnthropicPayload(systemPrompt, messages, model, maxTokens) {
+  const systemBlocks = systemPrompt
+    ? [
+        {
+          type: 'text',
+          text: systemPrompt,
+          cache_control: { type: 'ephemeral' },
+        },
+      ]
+    : undefined;
+
+  const formattedMessages = messages.map((msg, idx) => {
+    const isStablePrefixEnd = messages.length >= 2 && idx === messages.length - 2;
+    if (!isStablePrefixEnd) return msg;
+
+    if (typeof msg.content === 'string') {
+      return {
+        ...msg,
+        content: [
+          {
+            type: 'text',
+            text: msg.content,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      };
+    }
+
+    if (Array.isArray(msg.content) && msg.content.length > 0) {
+      const cloned = [...msg.content];
+      const lastIdx = cloned.length - 1;
+      const lastItem = cloned[lastIdx];
+      if (typeof lastItem === 'string') {
+        cloned[lastIdx] = {
+          type: 'text',
+          text: lastItem,
+          cache_control: { type: 'ephemeral' },
+        };
+      } else if (lastItem && typeof lastItem === 'object') {
+        cloned[lastIdx] = {
+          ...lastItem,
+          cache_control: { type: 'ephemeral' },
+        };
+      }
+      return { ...msg, content: cloned };
+    }
+
+    return msg;
+  });
+
+  return {
+    model,
+    max_tokens: maxTokens,
+    ...(systemBlocks ? { system: systemBlocks } : {}),
+    messages: formattedMessages,
+    stream: true,
+  };
+}
+
+function buildCachedOpenAICompatibleMessages(systemPrompt, messages) {
+  const result = [];
+  if (systemPrompt) {
+    result.push({
+      role: 'system',
+      content: [
+        {
+          type: 'text',
+          text: systemPrompt,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const isStablePrefixEnd = messages.length >= 2 && i === messages.length - 2;
+
+    if (isStablePrefixEnd && typeof msg.content === 'string') {
+      result.push({
+        ...msg,
+        content: [
+          {
+            type: 'text',
+            text: msg.content,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      });
+    } else {
+      result.push(msg);
+    }
+  }
+
+  return result;
+}
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
     status: 'running',
     provider: PROVIDER,
     primaryModel: PRIMARY_CLAUDE_MODEL,
+    promptCaching: true,
   });
 });
 
@@ -114,17 +216,32 @@ app.post('/api/chat', async (req, res) => {
       }
 
       const selectedModel = rawModel || 'claude-sonnet-4-5';
-      console.log('[anthropic] 使用模型:', selectedModel);
+      console.log('[anthropic] 使用模型 (缓存已启用):', selectedModel);
 
-      const stream = await anthropic.messages.create({
-        model: selectedModel,
-        max_tokens: resolvedMaxTokens,
-        ...(systemPrompt ? { system: systemPrompt } : {}),
+      const payload = buildCachedAnthropicPayload(
+        systemPrompt,
         messages,
-        stream: true,
-      });
+        selectedModel,
+        resolvedMaxTokens
+      );
+
+      const stream = await anthropic.messages.create(payload);
 
       for await (const event of stream) {
+        if (event?.message?.usage) {
+          const {
+            input_tokens = 0,
+            cache_creation_input_tokens = 0,
+            cache_read_input_tokens = 0,
+          } = event.message.usage;
+          console.log(
+            '[anthropic cache]',
+            `input=${input_tokens}`,
+            `write=${cache_creation_input_tokens}`,
+            `read=${cache_read_input_tokens}`
+          );
+        }
+
         if (
           event.type === 'content_block_delta' &&
           event.delta &&
@@ -149,9 +266,10 @@ app.post('/api/chat', async (req, res) => {
       new Set([mappedModel, ...QIMINGX_FALLBACK_MODELS].filter(Boolean))
     );
 
-    const formattedMessages = systemPrompt
-      ? [{ role: 'system', content: systemPrompt }, ...messages]
-      : messages;
+    const formattedMessages = buildCachedOpenAICompatibleMessages(
+      systemPrompt,
+      messages
+    );
 
     let upstreamRes = null;
     let activeModel = mappedModel;
@@ -216,6 +334,9 @@ app.post('/api/chat', async (req, res) => {
 
     if (!upstreamRes.body) {
       const json = await upstreamRes.json();
+      if (json?.usage) {
+        console.log('[qimingx usage]', JSON.stringify(json.usage));
+      }
       const fullText = json?.choices?.[0]?.message?.content || '';
       if (fullText) {
         res.write(`data: ${JSON.stringify({ text: fullText })}\n\n`);
@@ -245,6 +366,9 @@ app.post('/api/chat', async (req, res) => {
 
         try {
           const parsed = JSON.parse(payload);
+          if (parsed?.usage) {
+            console.log('[qimingx stream usage]', JSON.stringify(parsed.usage));
+          }
           const text =
             extractDeltaText(parsed?.choices?.[0]?.delta) ||
             parsed?.choices?.[0]?.message?.content ||
