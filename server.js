@@ -6,7 +6,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-const PROVIDER = (process.env.PROVIDER || 'qimingx').toLowerCase();
+// 默认切回 Anthropic 官方通道
+const PROVIDER = (process.env.PROVIDER || 'anthropic').toLowerCase();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const QIMINGX_API_KEY =
@@ -19,26 +20,6 @@ const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
   : null;
 
-const PRIMARY_CLAUDE_MODEL = '按量天狼星-claude-opus-4-8';
-
-const QIMINGX_FALLBACK_MODELS = [
-  PRIMARY_CLAUDE_MODEL,
-  '北极星-claude-opus-4-8',
-];
-
-const QIMINGX_MODEL_MAP = {
-  'o5.5': PRIMARY_CLAUDE_MODEL,
-  'f5.2': PRIMARY_CLAUDE_MODEL,
-  'f5.1': PRIMARY_CLAUDE_MODEL,
-  'f5': PRIMARY_CLAUDE_MODEL,
-  'f5.0': PRIMARY_CLAUDE_MODEL,
-  'claude-fable-5-0': PRIMARY_CLAUDE_MODEL,
-  'claude-fable-5': PRIMARY_CLAUDE_MODEL,
-  'claude-sonnet-4-6': PRIMARY_CLAUDE_MODEL,
-  'o5': PRIMARY_CLAUDE_MODEL,
-  'o4.6': PRIMARY_CLAUDE_MODEL,
-};
-
 function extractDeltaText(delta) {
   if (!delta) return '';
   if (typeof delta.content === 'string') return delta.content;
@@ -50,39 +31,6 @@ function extractDeltaText(delta) {
   return '';
 }
 
-function shouldRetryNextModel(status, errText) {
-  const text = String(errText || '');
-  return (
-    status === 502 ||
-    status === 503 ||
-    status === 504 ||
-    status === 429 ||
-    text.includes('没有可用的模型') ||
-    text.includes('service_unavailable') ||
-    text.includes('Bedrock error') ||
-    text.includes('timeout') ||
-    text.includes('aborted')
-  );
-}
-
-async function fetchWithTimeout(url, options, timeoutMs = 25000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * 构建带缓存断点的结构：
- * 1. Anthropic 官方 SDK：把 system 设为带 cache_control 的 block，并在倒数第二条历史消息挂断点
- * 2. 启明星（OpenAI 兼容接口）：将稳定的 system 置顶，并附加 cache_control 提示（兼容不支持该字段的上游时不会报错）
- */
 function buildCachedAnthropicPayload(systemPrompt, messages, model, maxTokens) {
   const systemBlocks = systemPrompt
     ? [
@@ -142,51 +90,11 @@ function buildCachedAnthropicPayload(systemPrompt, messages, model, maxTokens) {
   };
 }
 
-function buildCachedOpenAICompatibleMessages(systemPrompt, messages) {
-  const result = [];
-  if (systemPrompt) {
-    result.push({
-      role: 'system',
-      content: [
-        {
-          type: 'text',
-          text: systemPrompt,
-          cache_control: { type: 'ephemeral' },
-        },
-      ],
-    });
-  }
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    const isStablePrefixEnd = messages.length >= 2 && i === messages.length - 2;
-
-    if (isStablePrefixEnd && typeof msg.content === 'string') {
-      result.push({
-        ...msg,
-        content: [
-          {
-            type: 'text',
-            text: msg.content,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      });
-    } else {
-      result.push(msg);
-    }
-  }
-
-  return result;
-}
-
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
     status: 'running',
     provider: PROVIDER,
-    primaryModel: PRIMARY_CLAUDE_MODEL,
-    promptCaching: true,
   });
 });
 
@@ -200,8 +108,8 @@ app.post('/api/chat', async (req, res) => {
   const rawModel = typeof model === 'string' ? model.trim() : '';
   const resolvedMaxTokens =
     typeof maxTokens === 'number' && maxTokens > 0
-      ? Math.min(maxTokens, 1024)
-      : 600;
+      ? Math.min(maxTokens, 2048)
+      : 800;
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
 
@@ -215,8 +123,18 @@ app.post('/api/chat', async (req, res) => {
         throw new Error('缺少 ANTHROPIC_API_KEY 环境变量');
       }
 
-      const selectedModel = rawModel || 'claude-sonnet-4-5';
-      console.log('[anthropic] 使用模型 (缓存已启用):', selectedModel);
+      // 优先使用前端传来的官方模型名；若前端传的是非官方别名（如 f5.1），回退到官方默认模型
+      const looksLikeOfficialModel = /^claude-/i.test(rawModel);
+      const selectedModel = looksLikeOfficialModel
+        ? rawModel
+        : process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-sonnet-4-5';
+
+      console.log(
+        '[anthropic] 前端模型:',
+        rawModel || '(空)',
+        '| 实际请求:',
+        selectedModel
+      );
 
       const payload = buildCachedAnthropicPayload(
         systemPrompt,
@@ -259,93 +177,30 @@ app.post('/api/chat', async (req, res) => {
       throw new Error('缺少 QIMINGX_API_KEY 环境变量');
     }
 
-    const mappedModel =
-      QIMINGX_MODEL_MAP[rawModel] || rawModel || PRIMARY_CLAUDE_MODEL;
+    const formattedMessages = systemPrompt
+      ? [{ role: 'system', content: systemPrompt }, ...messages]
+      : messages;
 
-    const candidateModels = Array.from(
-      new Set([mappedModel, ...QIMINGX_FALLBACK_MODELS].filter(Boolean))
-    );
+    const resp = await fetch(QIMINGX_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${QIMINGX_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: rawModel || 'claude-sonnet-4-5',
+        messages: formattedMessages,
+        max_tokens: resolvedMaxTokens,
+        stream: true,
+      }),
+    });
 
-    const formattedMessages = buildCachedOpenAICompatibleMessages(
-      systemPrompt,
-      messages
-    );
-
-    let upstreamRes = null;
-    let activeModel = mappedModel;
-    let lastErr = null;
-
-    for (const candidate of candidateModels) {
-      activeModel = candidate;
-      console.log(
-        '[qimingx] 前端模型:',
-        rawModel || '(空)',
-        '| 尝试模型:',
-        candidate
-      );
-
-      try {
-        const resp = await fetchWithTimeout(
-          QIMINGX_BASE_URL,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${QIMINGX_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: candidate,
-              messages: formattedMessages,
-              max_tokens: resolvedMaxTokens,
-              stream: true,
-            }),
-          },
-          25000
-        );
-
-        if (resp.ok) {
-          upstreamRes = resp;
-          break;
-        }
-
-        const errText = await resp.text();
-        lastErr = new Error(`上游接口错误 ${resp.status}: ${errText}`);
-        console.warn('[qimingx] 尝试失败:', candidate, '->', lastErr.message);
-
-        if (!shouldRetryNextModel(resp.status, errText)) {
-          throw lastErr;
-        }
-      } catch (err) {
-        lastErr = err;
-        console.warn(
-          '[qimingx] 模型请求异常:',
-          candidate,
-          '->',
-          err?.message || err
-        );
-      }
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`上游接口错误 ${resp.status}: ${errText}`);
     }
 
-    if (!upstreamRes) {
-      throw lastErr || new Error('没有可用的模型，请稍后重试');
-    }
-
-    console.log('[qimingx] 最终接入模型:', activeModel);
-
-    if (!upstreamRes.body) {
-      const json = await upstreamRes.json();
-      if (json?.usage) {
-        console.log('[qimingx usage]', JSON.stringify(json.usage));
-      }
-      const fullText = json?.choices?.[0]?.message?.content || '';
-      if (fullText) {
-        res.write(`data: ${JSON.stringify({ text: fullText })}\n\n`);
-      }
-      res.write('data: [DONE]\n\n');
-      return res.end();
-    }
-
-    const reader = upstreamRes.body.getReader();
+    const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let sentAnyText = false;
@@ -366,27 +221,10 @@ app.post('/api/chat', async (req, res) => {
 
         try {
           const parsed = JSON.parse(payload);
-          if (parsed?.usage) {
-            console.log('[qimingx stream usage]', JSON.stringify(parsed.usage));
-          }
           const text =
             extractDeltaText(parsed?.choices?.[0]?.delta) ||
             parsed?.choices?.[0]?.message?.content ||
             '';
-          if (text) {
-            sentAnyText = true;
-            res.write(`data: ${JSON.stringify({ text })}\n\n`);
-          }
-        } catch (_) {}
-      }
-    }
-
-    if (buffer.trim().startsWith('data:')) {
-      const payload = buffer.trim().slice(5).trim();
-      if (payload && payload !== '[DONE]') {
-        try {
-          const parsed = JSON.parse(payload);
-          const text = extractDeltaText(parsed?.choices?.[0]?.delta);
           if (text) {
             sentAnyText = true;
             res.write(`data: ${JSON.stringify({ text })}\n\n`);
