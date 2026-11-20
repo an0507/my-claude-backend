@@ -84,7 +84,9 @@ app.post('/api/chat', async (req, res) => {
     '| maxTokens:',
     resolvedMaxTokens,
     '| 是否带 system:',
-    Boolean(systemPrompt)
+    Boolean(systemPrompt),
+    '| messages条数:',
+    messages.length
   );
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -94,34 +96,49 @@ app.post('/api/chat', async (req, res) => {
   let clientClosed = false;
   req.on('close', () => {
     clientClosed = true;
+    console.warn('[stream] 客户端连接已关闭 (req close)');
   });
 
   try {
+    console.log('[stream] 正在创建 Anthropic 流，模型:', selectedModel);
     const stream = await anthropic.messages.stream({
       model: selectedModel,
       max_tokens: resolvedMaxTokens,
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages,
     });
+    console.log('[stream] Anthropic 流已建立，等待 chunks...');
+
+    let gotFirstDelta = false;
+    let totalChunks = 0;
 
     for await (const chunk of stream) {
       if (clientClosed || res.writableEnded) {
+        console.warn('[stream] 检测到连接已断开或响应已结束，提前退出循环');
         break;
       }
       if (
         chunk.type === 'content_block_delta' &&
         chunk.delta?.type === 'text_delta'
       ) {
+        totalChunks += 1;
+        if (!gotFirstDelta) {
+          gotFirstDelta = true;
+          console.log('[stream] 收到首个 text_delta');
+        }
         res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
       }
     }
 
+    console.log('[stream] 流迭代结束，共推送 text_delta 数:', totalChunks);
+
     if (!clientClosed && !res.writableEnded) {
       res.write('data: [DONE]\n\n');
       res.end();
+      console.log('[stream] 已发送 [DONE] 并结束响应');
     }
   } catch (err) {
-    console.error(err);
+    console.error('[stream] 捕获到异常:', err?.status || '', err?.message || err);
     if (!clientClosed && !res.writableEnded) {
       const msg = err?.message || '出错了，请稍后再试';
       res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
