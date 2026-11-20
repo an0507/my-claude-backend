@@ -6,7 +6,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-// 通道开关：默认 'qimingx'，如需切回 Anthropic 官方可在 Render 设置 PROVIDER=anthropic
 const PROVIDER = (process.env.PROVIDER || 'qimingx').toLowerCase();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -20,21 +19,14 @@ const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
   : null;
 
-// 当前优先测试的克劳德模型
-const PRIMARY_CLAUDE_MODEL = '北极星-claude-opus-4-8';
+// 优先走日志中已成功接入的模型，避免先试多款模型导致超时
+const PRIMARY_CLAUDE_MODEL = '按量天狼星-claude-opus-4-8';
 
-// 遇到 502 / 503 或上游渠道错误时自动顺次尝试的备选模型列表
 const QIMINGX_FALLBACK_MODELS = [
   PRIMARY_CLAUDE_MODEL,
-  '北极星-claude-opus-4-7',
-  '北极星-claude-opus-4-5',
-  '北极星-claude-opus-5-5',
-  '按量天狼星-claude-opus-4-8',
-  '按量天狼星-claude-opus-4-7',
-  '按量天狼星-claude-opus-4-6',
+  '北极星-claude-opus-4-8',
 ];
 
-// 前端传入模型名 -> 优先映射到的模型名
 const QIMINGX_MODEL_MAP = {
   'o5.5': PRIMARY_CLAUDE_MODEL,
   'f5.2': PRIMARY_CLAUDE_MODEL,
@@ -64,10 +56,27 @@ function shouldRetryNextModel(status, errText) {
   return (
     status === 502 ||
     status === 503 ||
+    status === 504 ||
+    status === 429 ||
     text.includes('没有可用的模型') ||
     text.includes('service_unavailable') ||
-    text.includes('Bedrock error')
+    text.includes('Bedrock error') ||
+    text.includes('timeout') ||
+    text.includes('aborted')
   );
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 app.get('/health', (req, res) => {
@@ -89,8 +98,8 @@ app.post('/api/chat', async (req, res) => {
   const rawModel = typeof model === 'string' ? model.trim() : '';
   const resolvedMaxTokens =
     typeof maxTokens === 'number' && maxTokens > 0
-      ? Math.min(maxTokens, 2048)
-      : 800;
+      ? Math.min(maxTokens, 1024)
+      : 600;
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
 
@@ -157,31 +166,45 @@ app.post('/api/chat', async (req, res) => {
         candidate
       );
 
-      const resp = await fetch(QIMINGX_BASE_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${QIMINGX_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: candidate,
-          messages: formattedMessages,
-          max_tokens: resolvedMaxTokens,
-          stream: true,
-        }),
-      });
+      try {
+        const resp = await fetchWithTimeout(
+          QIMINGX_BASE_URL,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${QIMINGX_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: candidate,
+              messages: formattedMessages,
+              max_tokens: resolvedMaxTokens,
+              stream: true,
+            }),
+          },
+          25000
+        );
 
-      if (resp.ok) {
-        upstreamRes = resp;
-        break;
-      }
+        if (resp.ok) {
+          upstreamRes = resp;
+          break;
+        }
 
-      const errText = await resp.text();
-      lastErr = new Error(`上游接口错误 ${resp.status}: ${errText}`);
-      console.warn('[qimingx] 尝试失败:', candidate, '->', lastErr.message);
+        const errText = await resp.text();
+        lastErr = new Error(`上游接口错误 ${resp.status}: ${errText}`);
+        console.warn('[qimingx] 尝试失败:', candidate, '->', lastErr.message);
 
-      if (!shouldRetryNextModel(resp.status, errText)) {
-        throw lastErr;
+        if (!shouldRetryNextModel(resp.status, errText)) {
+          throw lastErr;
+        }
+      } catch (err) {
+        lastErr = err;
+        console.warn(
+          '[qimingx] 模型请求异常:',
+          candidate,
+          '->',
+          err?.message || err
+        );
       }
     }
 
