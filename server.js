@@ -23,7 +23,7 @@ const anthropic = ANTHROPIC_API_KEY
 // 当前优先测试的克劳德模型
 const PRIMARY_CLAUDE_MODEL = '北极星-claude-opus-4-8';
 
-// 遇到 503 或“没有可用的模型”时自动顺次尝试的备选模型列表
+// 遇到 502 / 503 或上游渠道错误时自动顺次尝试的备选模型列表
 const QIMINGX_FALLBACK_MODELS = [
   PRIMARY_CLAUDE_MODEL,
   '北极星-claude-opus-4-7',
@@ -62,9 +62,11 @@ function extractDeltaText(delta) {
 function shouldRetryNextModel(status, errText) {
   const text = String(errText || '');
   return (
+    status === 502 ||
     status === 503 ||
     text.includes('没有可用的模型') ||
-    text.includes('service_unavailable')
+    text.includes('service_unavailable') ||
+    text.includes('Bedrock error')
   );
 }
 
