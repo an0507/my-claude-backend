@@ -17,20 +17,22 @@ const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
   : null;
 
-// 按启明星模型广场里的实际模型 ID 映射（请替换为你确认可用的模型名）
+const TEST_CLAUDE_MODEL = '北极星-claude-opus-4-5';
+
+// 先全部映射到测试模型，方便快速验证连通性
 const QIMINGX_MODEL_MAP = {
-  'o5.5': '[摇光]gemini-3.5-flash',
-  'f5.2': '[摇光]gemini-3.5-flash',
-  'f5.1': '[摇光]gemini-3.5-flash',
-  'f5': '[摇光]gemini-3.5-flash',
-  'f5.0': '[摇光]gemini-3.5-flash',
-  'claude-fable-5-0': '[摇光]gemini-3.5-flash',
-  'claude-fable-5': '[摇光]gemini-3.5-flash',
-  'o5': '开阳-gemini-2.5-pro',
-  'o4.6': '开阳-gemini-2.5-pro',
+  'o5.5': TEST_CLAUDE_MODEL,
+  'f5.2': TEST_CLAUDE_MODEL,
+  'f5.1': TEST_CLAUDE_MODEL,
+  'f5': TEST_CLAUDE_MODEL,
+  'f5.0': TEST_CLAUDE_MODEL,
+  'claude-fable-5-0': TEST_CLAUDE_MODEL,
+  'claude-fable-5': TEST_CLAUDE_MODEL,
+  'o5': TEST_CLAUDE_MODEL,
+  'o4.6': TEST_CLAUDE_MODEL,
 };
 
-const QIMINGX_FALLBACK_MODEL = '[摇光]gemini-3.5-flash';
+const QIMINGX_FALLBACK_MODEL = TEST_CLAUDE_MODEL;
 
 function extractDeltaText(delta) {
   if (!delta) return '';
@@ -94,7 +96,6 @@ app.post('/api/chat', async (req, res) => {
       return res.end();
     }
 
-    // 默认走启明星（OpenAI 兼容接口）
     if (!QIMINGX_API_KEY) {
       throw new Error('缺少 QIMINGX_API_KEY 环境变量');
     }
@@ -131,6 +132,16 @@ app.post('/api/chat', async (req, res) => {
       throw new Error(`上游接口错误 ${upstreamRes.status}: ${errText}`);
     }
 
+    if (!upstreamRes.body) {
+      const json = await upstreamRes.json();
+      const fullText = json?.choices?.[0]?.message?.content || '';
+      if (fullText) {
+        res.write(`data: ${JSON.stringify({ text: fullText })}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
     const reader = upstreamRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -156,6 +167,20 @@ app.post('/api/chat', async (req, res) => {
             extractDeltaText(parsed?.choices?.[0]?.delta) ||
             parsed?.choices?.[0]?.message?.content ||
             '';
+          if (text) {
+            sentAnyText = true;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (buffer.trim().startsWith('data:')) {
+      const payload = buffer.trim().slice(5).trim();
+      if (payload && payload !== '[DONE]') {
+        try {
+          const parsed = JSON.parse(payload);
+          const text = extractDeltaText(parsed?.choices?.[0]?.delta);
           if (text) {
             sentAnyText = true;
             res.write(`data: ${JSON.stringify({ text })}\n\n`);
