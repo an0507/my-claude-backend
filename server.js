@@ -16,6 +16,9 @@ const MODEL_MAP = {
   'f5.2': 'claude-sonnet-4-6',
   'f5.1': 'claude-haiku-4-5-20251001',
   'f5': 'claude-haiku-4-5-20251001',
+  'f5.0': 'claude-haiku-4-5-20251001',
+  'claude-fable-5-0': 'claude-haiku-4-5-20251001',
+  'claude-fable-5': 'claude-haiku-4-5-20251001',
   'o5': 'claude-opus-4-6',
   'o4.6': 'claude-sonnet-4-6',
 };
