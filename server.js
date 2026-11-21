@@ -6,15 +6,28 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// 默认切回 Anthropic 官方通道
-const PROVIDER = (process.env.PROVIDER || 'anthropic').toLowerCase();
+// 默认走中转通道（如 OPAi / QimingX）；如需走官方直连，可在环境变量设置 PROVIDER=anthropic
+const PROVIDER = (process.env.PROVIDER || 'proxy').toLowerCase();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const QIMINGX_API_KEY =
-  process.env.QIMINGX_API_KEY || process.env.OPENAI_API_KEY || '';
-const QIMINGX_BASE_URL =
-  process.env.QIMINGX_BASE_URL ||
-  'https://api.qimingx.net/v1/chat/completions';
+const PROXY_API_KEY =
+  process.env.OPAI_API_KEY ||
+  process.env.QIMINGX_API_KEY ||
+  process.env.OPENAI_API_KEY ||
+  '';
+
+function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
+  const base = (rawUrl || fallbackUrl || '').trim().replace(/\/+$/, '');
+  if (!base) return '';
+  if (base.endsWith('/v1/chat/completions')) return base;
+  if (base.endsWith('/v1')) return `${base}/chat/completions`;
+  return `${base}/v1/chat/completions`;
+}
+
+const PROXY_BASE_URL = normalizeChatCompletionsUrl(
+  process.env.OPAI_BASE_URL || process.env.QIMINGX_BASE_URL,
+  'https://api.qimingx.net/v1/chat/completions'
+);
 
 const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
@@ -123,7 +136,6 @@ app.post('/api/chat', async (req, res) => {
         throw new Error('缺少 ANTHROPIC_API_KEY 环境变量');
       }
 
-      // 优先使用前端传来的官方模型名；若前端传的是非官方别名（如 f5.1），回退到官方默认模型
       const looksLikeOfficialModel = /^claude-/i.test(rawModel);
       const selectedModel = looksLikeOfficialModel
         ? rawModel
@@ -173,22 +185,36 @@ app.post('/api/chat', async (req, res) => {
       return res.end();
     }
 
-    if (!QIMINGX_API_KEY) {
-      throw new Error('缺少 QIMINGX_API_KEY 环境变量');
+    if (!PROXY_API_KEY) {
+      throw new Error(
+        '缺少 OPAI_API_KEY（或 QIMINGX_API_KEY / OPENAI_API_KEY）环境变量'
+      );
     }
+
+    const selectedProxyModel =
+      rawModel || process.env.PROXY_DEFAULT_MODEL || 'claude-sonnet-4-5';
+
+    console.log(
+      '[proxy] 端点:',
+      PROXY_BASE_URL,
+      '| 前端模型:',
+      rawModel || '(空)',
+      '| 实际请求:',
+      selectedProxyModel
+    );
 
     const formattedMessages = systemPrompt
       ? [{ role: 'system', content: systemPrompt }, ...messages]
       : messages;
 
-    const resp = await fetch(QIMINGX_BASE_URL, {
+    const resp = await fetch(PROXY_BASE_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${QIMINGX_API_KEY}`,
+        Authorization: `Bearer ${PROXY_API_KEY}`,
       },
       body: JSON.stringify({
-        model: rawModel || 'claude-sonnet-4-5',
+        model: selectedProxyModel,
         messages: formattedMessages,
         max_tokens: resolvedMaxTokens,
         stream: true,
