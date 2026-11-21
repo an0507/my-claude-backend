@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -5,6 +7,30 @@ const Anthropic = require('@anthropic-ai/sdk');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
+
+// 读取清理后的历史聊天记录作为常驻记忆
+const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
+let cleanedChatHistory = '';
+try {
+  if (fs.existsSync(HISTORY_FILE_PATH)) {
+    cleanedChatHistory = fs.readFileSync(HISTORY_FILE_PATH, 'utf8').trim();
+    console.log(
+      `[memory] 已加载 cleaned_chat_history.txt，长度: ${cleanedChatHistory.length} 字符`
+    );
+  } else {
+    console.log('[memory] 未找到 cleaned_chat_history.txt，跳过历史记忆注入');
+  }
+} catch (err) {
+  console.error('[memory] 读取 cleaned_chat_history.txt 失败:', err.message);
+}
+
+function buildMemoryPrefix() {
+  if (!cleanedChatHistory) return '';
+  return [
+    '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
+    cleanedChatHistory,
+  ].join('\n\n');
+}
 
 // 默认走中转通道（如 OPAi / QimingX）；如需走官方直连，可在环境变量设置 PROVIDER=anthropic
 const PROVIDER = (process.env.PROVIDER || 'proxy').toLowerCase();
@@ -44,19 +70,33 @@ function extractDeltaText(delta) {
   return '';
 }
 
-function buildCachedAnthropicPayload(systemPrompt, messages, model, maxTokens) {
-  const systemBlocks = systemPrompt
-    ? [
-        {
-          type: 'text',
-          text: systemPrompt,
-          cache_control: { type: 'ephemeral' },
-        },
-      ]
-    : undefined;
+function buildCachedAnthropicPayload(
+  memoryPrefix,
+  systemPrompt,
+  messages,
+  model,
+  maxTokens
+) {
+  const systemBlocks = [];
+
+  if (memoryPrefix) {
+    systemBlocks.push({
+      type: 'text',
+      text: memoryPrefix,
+      cache_control: { type: 'ephemeral' },
+    });
+  }
+
+  if (systemPrompt) {
+    systemBlocks.push({
+      type: 'text',
+      text: systemPrompt,
+    });
+  }
 
   const formattedMessages = messages.map((msg, idx) => {
-    const isStablePrefixEnd = messages.length >= 2 && idx === messages.length - 2;
+    const isStablePrefixEnd =
+      !memoryPrefix && messages.length >= 2 && idx === messages.length - 2;
     if (!isStablePrefixEnd) return msg;
 
     if (typeof msg.content === 'string') {
@@ -97,10 +137,36 @@ function buildCachedAnthropicPayload(systemPrompt, messages, model, maxTokens) {
   return {
     model,
     max_tokens: maxTokens,
-    ...(systemBlocks ? { system: systemBlocks } : {}),
+    ...(systemBlocks.length > 0 ? { system: systemBlocks } : {}),
     messages: formattedMessages,
     stream: true,
   };
+}
+
+function buildProxyMessages(memoryPrefix, systemPrompt, messages) {
+  const prefixMessages = [];
+
+  if (memoryPrefix) {
+    prefixMessages.push({
+      role: 'system',
+      content: [
+        {
+          type: 'text',
+          text: memoryPrefix,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+  }
+
+  if (systemPrompt) {
+    prefixMessages.push({
+      role: 'system',
+      content: systemPrompt,
+    });
+  }
+
+  return [...prefixMessages, ...messages];
 }
 
 app.get('/health', (req, res) => {
@@ -108,6 +174,8 @@ app.get('/health', (req, res) => {
     ok: true,
     status: 'running',
     provider: PROVIDER,
+    hasHistoryMemory: Boolean(cleanedChatHistory),
+    historyChars: cleanedChatHistory.length,
   });
 });
 
@@ -125,6 +193,7 @@ app.post('/api/chat', async (req, res) => {
       : 800;
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
+  const memoryPrefix = buildMemoryPrefix();
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -149,6 +218,7 @@ app.post('/api/chat', async (req, res) => {
       );
 
       const payload = buildCachedAnthropicPayload(
+        memoryPrefix,
         systemPrompt,
         messages,
         selectedModel,
@@ -203,9 +273,11 @@ app.post('/api/chat', async (req, res) => {
       selectedProxyModel
     );
 
-    const formattedMessages = systemPrompt
-      ? [{ role: 'system', content: systemPrompt }, ...messages]
-      : messages;
+    const formattedMessages = buildProxyMessages(
+      memoryPrefix,
+      systemPrompt,
+      messages
+    );
 
     const resp = await fetch(PROXY_BASE_URL, {
       method: 'POST',
