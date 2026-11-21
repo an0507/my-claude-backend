@@ -52,7 +52,7 @@ function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
 
 const PROXY_BASE_URL = normalizeChatCompletionsUrl(
   process.env.OPAI_BASE_URL || process.env.QIMINGX_BASE_URL,
-  'https://api.qimingx.net/v1/chat/completions'
+  'https://opai.pro/v1/chat/completions'
 );
 
 const anthropic = ANTHROPIC_API_KEY
