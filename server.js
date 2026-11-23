@@ -42,12 +42,16 @@ function buildMemoryPrefix() {
   ].join('\n\n');
 }
 
-function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
+// 统一转成 Anthropic 原生 /v1/messages 地址，确保透传 cache_control 命中缓存
+function normalizeAnthropicMessagesUrl(rawUrl, fallbackUrl) {
   const base = (rawUrl || fallbackUrl || '').trim().replace(/\/+$/, '');
   if (!base) return '';
-  if (base.endsWith('/v1/chat/completions')) return base;
-  if (base.endsWith('/v1')) return `${base}/chat/completions`;
-  return `${base}/v1/chat/completions`;
+  if (base.endsWith('/v1/messages')) return base;
+  if (base.endsWith('/v1/chat/completions')) {
+    return base.replace(/\/v1\/chat\/completions$/, '/v1/messages');
+  }
+  if (base.endsWith('/v1')) return `${base}/messages`;
+  return `${base}/v1/messages`;
 }
 
 // 去掉类似 "[Kiro-企业正价]" 的中转前缀
@@ -92,30 +96,30 @@ function normalizeOfficialModel(rawModel = '') {
 }
 
 // 1. wawazz（当前主站）
-const WAWAZZ_BASE_URL = normalizeChatCompletionsUrl(
+const WAWAZZ_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.WAWAZZ_BASE_URL,
-  'https://wawazz.xyz/v1/chat/completions'
+  'https://wawazz.xyz/v1/messages'
 );
 const WAWAZZ_API_KEY = (process.env.WAWAZZ_API_KEY || '').trim();
 
 // 2. 奇异果（备用站 1）
-const QIYIGUO_BASE_URL = normalizeChatCompletionsUrl(
+const QIYIGUO_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.QIYIGUO_BASE_URL,
-  'https://api.qiyiguo.uk/v1/chat/completions'
+  'https://api.qiyiguo.uk/v1/messages'
 );
 const QIYIGUO_API_KEY = (process.env.QIYIGUO_API_KEY || '').trim();
 
 // 3. 小忆（备用站 2）
-const XIAOYI_BASE_URL = normalizeChatCompletionsUrl(
+const XIAOYI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.XIAOYI_BASE_URL,
-  'https://api.chr1.com/v1/chat/completions'
+  'https://api.chr1.com/v1/messages'
 );
 const XIAOYI_API_KEY = (process.env.XIAOYI_API_KEY || '').trim();
 
 // 4. opai（备用站 3，以后随时可用）
-const OPAI_BASE_URL = normalizeChatCompletionsUrl(
+const OPAI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.OPAI_BASE_URL,
-  'https://opai.pro/v1/chat/completions'
+  'https://opai.pro/v1/messages'
 );
 const OPAI_API_KEY = (
   process.env.OPAI_BACKUP_API_KEY ||
@@ -132,41 +136,41 @@ const anthropic = ANTHROPIC_API_KEY
 function buildProxyStations() {
   const stations = [];
 
-  if (WAWAZZ_BASE_URL && WAWAZZ_API_KEY) {
+  if (WAWAZZ_MESSAGES_URL && WAWAZZ_API_KEY) {
     stations.push({
       name: 'wawazz',
-      url: WAWAZZ_BASE_URL,
+      url: WAWAZZ_MESSAGES_URL,
       apiKey: WAWAZZ_API_KEY,
       resolveModel: resolveStandardProxyModel,
     });
   }
 
-  if (QIYIGUO_BASE_URL && QIYIGUO_API_KEY) {
+  if (QIYIGUO_MESSAGES_URL && QIYIGUO_API_KEY) {
     stations.push({
       name: '奇异果',
-      url: QIYIGUO_BASE_URL,
+      url: QIYIGUO_MESSAGES_URL,
       apiKey: QIYIGUO_API_KEY,
       resolveModel: resolveStandardProxyModel,
     });
   }
 
-  if (XIAOYI_BASE_URL && XIAOYI_API_KEY) {
+  if (XIAOYI_MESSAGES_URL && XIAOYI_API_KEY) {
     stations.push({
       name: '小忆',
-      url: XIAOYI_BASE_URL,
+      url: XIAOYI_MESSAGES_URL,
       apiKey: XIAOYI_API_KEY,
       resolveModel: resolveXiaoyiModel,
     });
   }
 
-  if (OPAI_BASE_URL && OPAI_API_KEY) {
+  if (OPAI_MESSAGES_URL && OPAI_API_KEY) {
     const isDuplicate = stations.some(
-      (s) => s.url === OPAI_BASE_URL && s.apiKey === OPAI_API_KEY
+      (s) => s.url === OPAI_MESSAGES_URL && s.apiKey === OPAI_API_KEY
     );
     if (!isDuplicate) {
       stations.push({
         name: 'opai',
-        url: OPAI_BASE_URL,
+        url: OPAI_MESSAGES_URL,
         apiKey: OPAI_API_KEY,
         resolveModel: resolveStandardProxyModel,
       });
@@ -183,17 +187,6 @@ console.log(
   '| 官方兜底:',
   anthropic ? '已启用(claude-opus-4-6)' : '未配置'
 );
-
-function extractDeltaText(delta) {
-  if (!delta) return '';
-  if (typeof delta.content === 'string') return delta.content;
-  if (Array.isArray(delta.content)) {
-    return delta.content
-      .map((part) => (typeof part === 'string' ? part : part?.text || ''))
-      .join('');
-  }
-  return '';
-}
 
 function buildCachedAnthropicPayload(
   memoryPrefix,
@@ -216,48 +209,50 @@ function buildCachedAnthropicPayload(
     systemBlocks.push({
       type: 'text',
       text: systemPrompt,
+      cache_control: { type: 'ephemeral' },
     });
   }
 
-  const formattedMessages = messages.map((msg, idx) => {
-    const isStablePrefixEnd =
-      !memoryPrefix && messages.length >= 2 && idx === messages.length - 2;
-    if (!isStablePrefixEnd) return msg;
+  const formattedMessages = messages
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
+    .map((msg, idx, arr) => {
+      const isSecondLast = arr.length >= 2 && idx === arr.length - 2;
+      if (!isSecondLast) return msg;
 
-    if (typeof msg.content === 'string') {
-      return {
-        ...msg,
-        content: [
-          {
-            type: 'text',
-            text: msg.content,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      };
-    }
-
-    if (Array.isArray(msg.content) && msg.content.length > 0) {
-      const cloned = [...msg.content];
-      const lastIdx = cloned.length - 1;
-      const lastItem = cloned[lastIdx];
-      if (typeof lastItem === 'string') {
-        cloned[lastIdx] = {
-          type: 'text',
-          text: lastItem,
-          cache_control: { type: 'ephemeral' },
-        };
-      } else if (lastItem && typeof lastItem === 'object') {
-        cloned[lastIdx] = {
-          ...lastItem,
-          cache_control: { type: 'ephemeral' },
+      if (typeof msg.content === 'string') {
+        return {
+          ...msg,
+          content: [
+            {
+              type: 'text',
+              text: msg.content,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
         };
       }
-      return { ...msg, content: cloned };
-    }
 
-    return msg;
-  });
+      if (Array.isArray(msg.content) && msg.content.length > 0) {
+        const cloned = [...msg.content];
+        const lastIdx = cloned.length - 1;
+        const lastItem = cloned[lastIdx];
+        if (typeof lastItem === 'string') {
+          cloned[lastIdx] = {
+            type: 'text',
+            text: lastItem,
+            cache_control: { type: 'ephemeral' },
+          };
+        } else if (lastItem && typeof lastItem === 'object') {
+          cloned[lastIdx] = {
+            ...lastItem,
+            cache_control: { type: 'ephemeral' },
+          };
+        }
+        return { ...msg, content: cloned };
+      }
+
+      return msg;
+    });
 
   return {
     model,
@@ -266,32 +261,6 @@ function buildCachedAnthropicPayload(
     messages: formattedMessages,
     stream: true,
   };
-}
-
-function buildProxyMessages(memoryPrefix, systemPrompt, messages) {
-  const prefixMessages = [];
-
-  if (memoryPrefix) {
-    prefixMessages.push({
-      role: 'system',
-      content: [
-        {
-          type: 'text',
-          text: memoryPrefix,
-          cache_control: { type: 'ephemeral' },
-        },
-      ],
-    });
-  }
-
-  if (systemPrompt) {
-    prefixMessages.push({
-      role: 'system',
-      content: systemPrompt,
-    });
-  }
-
-  return [...prefixMessages, ...messages];
 }
 
 function isFailoverError(err) {
@@ -360,16 +329,10 @@ app.post('/api/chat', async (req, res) => {
   req.on('close', cleanup);
 
   try {
-    const formattedMessages = buildProxyMessages(
-      memoryPrefix,
-      systemPrompt,
-      messages
-    );
-
     let lastError = null;
     let sentAnyText = false;
 
-    // 1. 依次尝试中转站（wawazz -> 奇异果 -> 小忆 -> opai）
+    // 1. 依次尝试中转站（wawazz -> 奇异果 -> 小忆 -> opai），走原生 /v1/messages 透传缓存
     for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
       const station = PROXY_STATIONS[i];
       const targetProxyModel = station.resolveModel(rawModel);
@@ -382,18 +345,23 @@ app.post('/api/chat', async (req, res) => {
       );
 
       try {
+        const anthropicPayload = buildCachedAnthropicPayload(
+          memoryPrefix,
+          systemPrompt,
+          messages,
+          targetProxyModel,
+          resolvedMaxTokens
+        );
+
         const resp = await fetch(station.url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            'x-api-key': station.apiKey,
             Authorization: `Bearer ${station.apiKey}`,
+            'anthropic-version': '2023-06-01',
           },
-          body: JSON.stringify({
-            model: targetProxyModel,
-            messages: formattedMessages,
-            max_tokens: resolvedMaxTokens,
-            stream: true,
-          }),
+          body: JSON.stringify(anthropicPayload),
         });
 
         if (!resp.ok) {
@@ -427,23 +395,42 @@ app.post('/api/chat', async (req, res) => {
 
             try {
               const parsed = JSON.parse(payload);
-              if (parsed?.error) {
+
+              const usage = parsed?.message?.usage || parsed?.usage;
+              if (usage) {
+                console.log(
+                  `[${station.name} cache]`,
+                  `input=${usage.input_tokens ?? 0}`,
+                  `cache_write=${usage.cache_creation_input_tokens ?? 0}`,
+                  `cache_read=${usage.cache_read_input_tokens ?? 0}`,
+                  `output=${usage.output_tokens ?? 0}`
+                );
+              }
+
+              if (parsed?.type === 'error' || parsed?.error) {
+                const errObj = parsed.error || parsed;
                 const upstreamErr = new Error(
                   `[${station.name}] 流内错误: ${
-                    typeof parsed.error === 'string'
-                      ? parsed.error
-                      : JSON.stringify(parsed.error)
+                    typeof errObj === 'string' ? errObj : JSON.stringify(errObj)
                   }`
                 );
-                upstreamErr.statusCode = Number(parsed.error?.code) || 502;
+                upstreamErr.statusCode = Number(errObj?.code) || 502;
                 upstreamErr.isFailover = !stationSentText;
                 throw upstreamErr;
               }
 
-              const text =
-                extractDeltaText(parsed?.choices?.[0]?.delta) ||
-                parsed?.choices?.[0]?.message?.content ||
-                '';
+              let text = '';
+              if (
+                parsed?.type === 'content_block_delta' &&
+                parsed?.delta?.type === 'text_delta'
+              ) {
+                text = parsed.delta.text || '';
+              } else if (
+                typeof parsed?.choices?.[0]?.delta?.content === 'string'
+              ) {
+                text = parsed.choices[0].delta.content;
+              }
+
               if (text) {
                 if (!announcedChannel) {
                   announcedChannel = true;
