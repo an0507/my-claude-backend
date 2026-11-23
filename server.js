@@ -267,9 +267,12 @@ function isFailoverError(err) {
   if (!err) return false;
   if (err.isFailover === true) return true;
   const status = Number(err.statusCode || 0);
-  if ([408, 429, 500, 502, 503, 504].includes(status)) return true;
+  if ([404, 408, 429, 500, 502, 503, 504].includes(status)) return true;
   const msg = String(err.message || '').toLowerCase();
   return (
+    msg.includes('404') ||
+    msg.includes('model_not_found') ||
+    msg.includes('not supported') ||
     msg.includes('502') ||
     msg.includes('503') ||
     msg.includes('504') ||
