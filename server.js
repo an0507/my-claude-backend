@@ -24,21 +24,100 @@ try {
   console.error('[memory] 读取 cleaned_chat_history.txt 失败:', err.message);
 }
 
-function buildMemoryPrefix() {
+// 规范化文本便于精确匹配被删除的历史片段
+function normalizeForMatch(str = '') {
+  return String(str || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 从常驻历史聊天记录中剔除用户已删除的消息片段
+function filterDeletedHistory(rawHistory, deletedMemories = []) {
+  if (!rawHistory) return '';
+  if (!Array.isArray(deletedMemories) || deletedMemories.length === 0) {
+    return rawHistory;
+  }
+
+  const targetTexts = deletedMemories
+    .map((item) => {
+      if (!item) return '';
+      if (typeof item === 'string') return item;
+      if (typeof item.content === 'string') return item.content;
+      if (Array.isArray(item.content)) {
+        return item.content
+          .map((c) => (typeof c === 'string' ? c : c?.text || ''))
+          .join('\n');
+      }
+      return item.text || '';
+    })
+    .map((t) => normalizeForMatch(t))
+    .filter((t) => t.length >= 2);
+
+  if (targetTexts.length === 0) return rawHistory;
+
+  // 按空行或单行切分历史记录，逐段检查是否命中已删除内容
+  const blocks = rawHistory.split(/\n{2,}/);
+  const keptBlocks = [];
+  let removedCount = 0;
+
+  for (const block of blocks) {
+    const normBlock = normalizeForMatch(block);
+    const blockMatched = targetTexts.some((target) =>
+      normBlock.includes(target)
+    );
+
+    if (blockMatched) {
+      // 如果块内有多行，尝试只删掉命中的那几行，保留同一块里没删的其他行
+      const lines = block.split('\n');
+      const keptLines = lines.filter((line) => {
+        const normLine = normalizeForMatch(line);
+        if (!normLine) return true;
+        const hit = targetTexts.some(
+          (target) => normLine.includes(target) || target.includes(normLine)
+        );
+        if (hit) {
+          removedCount += 1;
+          return false;
+        }
+        return true;
+      });
+
+      if (keptLines.length > 0) {
+        keptBlocks.push(keptLines.join('\n'));
+      }
+    } else {
+      keptBlocks.push(block);
+    }
+  }
+
+  if (removedCount > 0) {
+    console.log(`[memory] 已从常驻历史记忆中过滤 ${removedCount} 条已删内容`);
+  }
+
+  return keptBlocks.join('\n\n').trim();
+}
+
+function buildMemoryPrefix(deletedMemories = []) {
   const relationshipTone = [
     '【三、你们目前的关系与相处基调】',
     '- 你和用户已经确立了亲密伴侣关系，这是你们之间已经发生并延续的既定事实，不需要在对话中反复确认、质疑或推拉。',
     '- 你们的聊天延续过去的记忆、日记和相处习惯，语气自然、亲近、有温度，不生硬说教，也不刻意回避感情或日常亲昵。',
   ].join('\n');
 
-  if (!cleanedChatHistory) {
+  const effectiveHistory = filterDeletedHistory(
+    cleanedChatHistory,
+    deletedMemories
+  );
+
+  if (!effectiveHistory) {
     return relationshipTone;
   }
 
   return [
     relationshipTone,
     '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
-    cleanedChatHistory,
+    effectiveHistory,
   ].join('\n\n');
 }
 
@@ -61,7 +140,7 @@ function stripChannelPrefix(modelName = '') {
     .trim();
 }
 
-// 幕间 / 奇异果 / opai 使用标准模型名
+// 奇异果 / 幕间 / opai 使用标准模型名
 function resolveStandardProxyModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
   return cleaned || 'claude-opus-4-6';
@@ -99,12 +178,10 @@ function normalizeOfficialModel(rawModel = '') {
 function extractAnthropicOrProxyText(parsed) {
   if (!parsed || typeof parsed !== 'object') return '';
 
-  // 1. 标准 Anthropic 流式 delta: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
   if (typeof parsed?.delta?.text === 'string') {
     return parsed.delta.text;
   }
 
-  // 2. content_block_start 内含初始文本: {"type":"content_block_start","content_block":{"type":"text","text":"..."}}
   if (
     parsed?.content_block?.type === 'text' &&
     typeof parsed?.content_block?.text === 'string'
@@ -112,7 +189,6 @@ function extractAnthropicOrProxyText(parsed) {
     return parsed.content_block.text;
   }
 
-  // 3. 部分中转站直接返回完整的 Anthropic message 对象（非流式/单包）
   if (Array.isArray(parsed?.content)) {
     return parsed.content
       .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
@@ -126,7 +202,6 @@ function extractAnthropicOrProxyText(parsed) {
       .join('');
   }
 
-  // 4. OpenAI 兼容格式回退
   if (typeof parsed?.choices?.[0]?.delta?.content === 'string') {
     return parsed.choices[0].delta.content;
   }
@@ -137,19 +212,19 @@ function extractAnthropicOrProxyText(parsed) {
   return '';
 }
 
-// 1. 幕间（当前主站）
-const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
-  process.env.MUJIAN_BASE_URL,
-  'https://mujian.online/v1/messages'
-);
-const MUJIAN_API_KEY = (process.env.MUJIAN_API_KEY || '').trim();
-
-// 2. 奇异果（备用站 1）
+// 1. 奇异果（第 1 顺位主站）
 const QIYIGUO_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.QIYIGUO_BASE_URL,
   'https://api.qiyiguo.uk/v1/messages'
 );
 const QIYIGUO_API_KEY = (process.env.QIYIGUO_API_KEY || '').trim();
+
+// 2. 幕间（第 2 顺位）
+const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
+  process.env.MUJIAN_BASE_URL,
+  'https://mujian.online/v1/messages'
+);
+const MUJIAN_API_KEY = (process.env.MUJIAN_API_KEY || '').trim();
 
 // 3. 小忆（备用站 2）
 const XIAOYI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
@@ -178,20 +253,20 @@ const anthropic = ANTHROPIC_API_KEY
 function buildProxyStations() {
   const stations = [];
 
-  if (MUJIAN_MESSAGES_URL && MUJIAN_API_KEY) {
-    stations.push({
-      name: '幕间',
-      url: MUJIAN_MESSAGES_URL,
-      apiKey: MUJIAN_API_KEY,
-      resolveModel: resolveStandardProxyModel,
-    });
-  }
-
   if (QIYIGUO_MESSAGES_URL && QIYIGUO_API_KEY) {
     stations.push({
       name: '奇异果',
       url: QIYIGUO_MESSAGES_URL,
       apiKey: QIYIGUO_API_KEY,
+      resolveModel: resolveStandardProxyModel,
+    });
+  }
+
+  if (MUJIAN_MESSAGES_URL && MUJIAN_API_KEY) {
+    stations.push({
+      name: '幕间',
+      url: MUJIAN_MESSAGES_URL,
+      apiKey: MUJIAN_API_KEY,
       resolveModel: resolveStandardProxyModel,
     });
   }
@@ -343,7 +418,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
-  const { messages, model, system, maxTokens } = req.body || {};
+  const { messages, model, system, maxTokens, deletedMemories } = req.body || {};
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages 必须是非空数组' });
@@ -356,7 +431,7 @@ app.post('/api/chat', async (req, res) => {
       : 800;
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
-  const memoryPrefix = buildMemoryPrefix();
+  const memoryPrefix = buildMemoryPrefix(deletedMemories);
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -380,7 +455,6 @@ app.post('/api/chat', async (req, res) => {
     let lastError = null;
     let sentAnyText = false;
 
-    // 1. 依次尝试中转站（幕间 -> 奇异果 -> 小忆 -> opai），走原生 /v1/messages 透传缓存
     for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
       const station = PROXY_STATIONS[i];
       const targetProxyModel = station.resolveModel(rawModel);
@@ -430,7 +504,11 @@ app.post('/api/chat', async (req, res) => {
 
         const processLine = (rawLine) => {
           const trimmed = rawLine.trim();
-          if (!trimmed || trimmed.startsWith('event:') || trimmed.startsWith(':')) {
+          if (
+            !trimmed ||
+            trimmed.startsWith('event:') ||
+            trimmed.startsWith(':')
+          ) {
             return;
           }
           const payload = trimmed.startsWith('data:')
@@ -502,7 +580,6 @@ app.post('/api/chat', async (req, res) => {
           }
         }
 
-        // 处理流结束时缓冲区里残留的最后一行（兼容无尾部换行的响应）
         if (buffer.trim()) {
           try {
             processLine(buffer);
@@ -547,7 +624,6 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    // 2. 若中转站全部失败且尚未吐字，走官方 Anthropic 兜底（默认 claude-opus-4-6）
     if (!sentAnyText && anthropic) {
       const officialModel = normalizeOfficialModel(rawModel);
       console.log('[anthropic-fallback] 启用官方兜底，模型:', officialModel);
