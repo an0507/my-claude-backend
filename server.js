@@ -61,16 +61,16 @@ function stripChannelPrefix(modelName = '') {
     .trim();
 }
 
-// wawazz / 奇异果 / opai 使用标准模型名
+// 幕间 / 奇异果 / opai 使用标准模型名
 function resolveStandardProxyModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  return cleaned || 'claude-opus-5.5';
+  return cleaned || 'claude-opus-4-6';
 }
 
 // 切到小忆时，自动映射为小忆支持的 [Kiro-企业正价] 模型
 function resolveXiaoyiModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  if (!cleaned) return '[Kiro-企业正价]claude-opus-5-5';
+  if (!cleaned) return '[Kiro-企业正价]claude-opus-4-6';
   if (/^\[[^\]]+\]/.test(rawModel)) return rawModel;
   if (cleaned === 'claude-opus-4-6') return '[Kiro-企业正价]claude-opus-4-6';
   if (
@@ -95,12 +95,12 @@ function normalizeOfficialModel(rawModel = '') {
   return process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
 }
 
-// 1. wawazz（当前主站）
-const WAWAZZ_MESSAGES_URL = normalizeAnthropicMessagesUrl(
-  process.env.WAWAZZ_BASE_URL,
-  'https://wawazz.xyz/v1/messages'
+// 1. 幕间（当前主站）
+const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
+  process.env.MUJIAN_BASE_URL,
+  'https://mujian.online/v1/messages'
 );
-const WAWAZZ_API_KEY = (process.env.WAWAZZ_API_KEY || '').trim();
+const MUJIAN_API_KEY = (process.env.MUJIAN_API_KEY || '').trim();
 
 // 2. 奇异果（备用站 1）
 const QIYIGUO_MESSAGES_URL = normalizeAnthropicMessagesUrl(
@@ -136,11 +136,11 @@ const anthropic = ANTHROPIC_API_KEY
 function buildProxyStations() {
   const stations = [];
 
-  if (WAWAZZ_MESSAGES_URL && WAWAZZ_API_KEY) {
+  if (MUJIAN_MESSAGES_URL && MUJIAN_API_KEY) {
     stations.push({
-      name: 'wawazz',
-      url: WAWAZZ_MESSAGES_URL,
-      apiKey: WAWAZZ_API_KEY,
+      name: '幕间',
+      url: MUJIAN_MESSAGES_URL,
+      apiKey: MUJIAN_API_KEY,
       resolveModel: resolveStandardProxyModel,
     });
   }
@@ -335,7 +335,7 @@ app.post('/api/chat', async (req, res) => {
     let lastError = null;
     let sentAnyText = false;
 
-    // 1. 依次尝试中转站（wawazz -> 奇异果 -> 小忆 -> opai），走原生 /v1/messages 透传缓存
+    // 1. 依次尝试中转站（幕间 -> 奇异果 -> 小忆 -> opai），走原生 /v1/messages 透传缓存
     for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
       const station = PROXY_STATIONS[i];
       const targetProxyModel = station.resolveModel(rawModel);
