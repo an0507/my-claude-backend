@@ -56,7 +56,6 @@ function filterDeletedHistory(rawHistory, deletedMemories = []) {
 
   if (targetTexts.length === 0) return rawHistory;
 
-  // 按空行或单行切分历史记录，逐段检查是否命中已删除内容
   const blocks = rawHistory.split(/\n{2,}/);
   const keptBlocks = [];
   let removedCount = 0;
@@ -68,7 +67,6 @@ function filterDeletedHistory(rawHistory, deletedMemories = []) {
     );
 
     if (blockMatched) {
-      // 如果块内有多行，尝试只删掉命中的那几行，保留同一块里没删的其他行
       const lines = block.split('\n');
       const keptLines = lines.filter((line) => {
         const normLine = normalizeForMatch(line);
@@ -140,7 +138,7 @@ function stripChannelPrefix(modelName = '') {
     .trim();
 }
 
-// 奇异果 / 幕间 / opai 使用标准模型名
+// opai / 奇异果 / 幕间 使用标准模型名
 function resolveStandardProxyModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
   return cleaned || 'claude-opus-4-6';
@@ -212,28 +210,7 @@ function extractAnthropicOrProxyText(parsed) {
   return '';
 }
 
-// 1. 奇异果（第 1 顺位主站）
-const QIYIGUO_MESSAGES_URL = normalizeAnthropicMessagesUrl(
-  process.env.QIYIGUO_BASE_URL,
-  'https://api.qiyiguo.uk/v1/messages'
-);
-const QIYIGUO_API_KEY = (process.env.QIYIGUO_API_KEY || '').trim();
-
-// 2. 幕间（第 2 顺位）
-const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
-  process.env.MUJIAN_BASE_URL,
-  'https://mujian.online/v1/messages'
-);
-const MUJIAN_API_KEY = (process.env.MUJIAN_API_KEY || '').trim();
-
-// 3. 小忆（备用站 2）
-const XIAOYI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
-  process.env.XIAOYI_BASE_URL,
-  'https://api.chr1.com/v1/messages'
-);
-const XIAOYI_API_KEY = (process.env.XIAOYI_API_KEY || '').trim();
-
-// 4. opai（备用站 3，以后随时可用）
+// 1. opai（第 1 顺位主站）
 const OPAI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.OPAI_BASE_URL,
   'https://opai.pro/v1/messages'
@@ -244,6 +221,27 @@ const OPAI_API_KEY = (
   ''
 ).trim();
 
+// 2. 奇异果（第 2 顺位）
+const QIYIGUO_MESSAGES_URL = normalizeAnthropicMessagesUrl(
+  process.env.QIYIGUO_BASE_URL,
+  'https://api.qiyiguo.uk/v1/messages'
+);
+const QIYIGUO_API_KEY = (process.env.QIYIGUO_API_KEY || '').trim();
+
+// 3. 幕间（第 3 顺位）
+const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
+  process.env.MUJIAN_BASE_URL,
+  'https://mujian.online/v1/messages'
+);
+const MUJIAN_API_KEY = (process.env.MUJIAN_API_KEY || '').trim();
+
+// 4. 小忆（第 4 顺位）
+const XIAOYI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
+  process.env.XIAOYI_BASE_URL,
+  'https://api.chr1.com/v1/messages'
+);
+const XIAOYI_API_KEY = (process.env.XIAOYI_API_KEY || '').trim();
+
 // 5. 官方 Anthropic（最终兜底）
 const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').trim();
 const anthropic = ANTHROPIC_API_KEY
@@ -252,6 +250,15 @@ const anthropic = ANTHROPIC_API_KEY
 
 function buildProxyStations() {
   const stations = [];
+
+  if (OPAI_MESSAGES_URL && OPAI_API_KEY) {
+    stations.push({
+      name: 'opai',
+      url: OPAI_MESSAGES_URL,
+      apiKey: OPAI_API_KEY,
+      resolveModel: resolveStandardProxyModel,
+    });
+  }
 
   if (QIYIGUO_MESSAGES_URL && QIYIGUO_API_KEY) {
     stations.push({
@@ -278,20 +285,6 @@ function buildProxyStations() {
       apiKey: XIAOYI_API_KEY,
       resolveModel: resolveXiaoyiModel,
     });
-  }
-
-  if (OPAI_MESSAGES_URL && OPAI_API_KEY) {
-    const isDuplicate = stations.some(
-      (s) => s.url === OPAI_MESSAGES_URL && s.apiKey === OPAI_API_KEY
-    );
-    if (!isDuplicate) {
-      stations.push({
-        name: 'opai',
-        url: OPAI_MESSAGES_URL,
-        apiKey: OPAI_API_KEY,
-        resolveModel: resolveStandardProxyModel,
-      });
-    }
   }
 
   return stations;
