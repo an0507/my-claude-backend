@@ -95,6 +95,48 @@ function normalizeOfficialModel(rawModel = '') {
   return process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
 }
 
+// 兼容提取 Anthropic 原生流 / 非流 / OpenAI 兼容流里的文本增量
+function extractAnthropicOrProxyText(parsed) {
+  if (!parsed || typeof parsed !== 'object') return '';
+
+  // 1. 标准 Anthropic 流式 delta: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+  if (typeof parsed?.delta?.text === 'string') {
+    return parsed.delta.text;
+  }
+
+  // 2. content_block_start 内含初始文本: {"type":"content_block_start","content_block":{"type":"text","text":"..."}}
+  if (
+    parsed?.content_block?.type === 'text' &&
+    typeof parsed?.content_block?.text === 'string'
+  ) {
+    return parsed.content_block.text;
+  }
+
+  // 3. 部分中转站直接返回完整的 Anthropic message 对象（非流式/单包）
+  if (Array.isArray(parsed?.content)) {
+    return parsed.content
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('');
+  }
+  if (Array.isArray(parsed?.message?.content)) {
+    return parsed.message.content
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('');
+  }
+
+  // 4. OpenAI 兼容格式回退
+  if (typeof parsed?.choices?.[0]?.delta?.content === 'string') {
+    return parsed.choices[0].delta.content;
+  }
+  if (typeof parsed?.choices?.[0]?.message?.content === 'string') {
+    return parsed.choices[0].message.content;
+  }
+
+  return '';
+}
+
 // 1. 幕间（当前主站）
 const MUJIAN_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.MUJIAN_BASE_URL,
@@ -267,10 +309,13 @@ function isFailoverError(err) {
   if (!err) return false;
   if (err.isFailover === true) return true;
   const status = Number(err.statusCode || 0);
-  if ([404, 408, 429, 500, 502, 503, 504].includes(status)) return true;
+  if ([403, 404, 408, 429, 500, 502, 503, 504].includes(status)) return true;
   const msg = String(err.message || '').toLowerCase();
   return (
+    msg.includes('403') ||
     msg.includes('404') ||
+    msg.includes('额度不足') ||
+    msg.includes('insufficient') ||
     msg.includes('model_not_found') ||
     msg.includes('not supported') ||
     msg.includes('502') ||
@@ -381,6 +426,62 @@ app.post('/api/chat', async (req, res) => {
         let buffer = '';
         let stationSentText = false;
         let announcedChannel = false;
+        let rawSampleLogged = false;
+
+        const processLine = (rawLine) => {
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith('event:') || trimmed.startsWith(':')) {
+            return;
+          }
+          const payload = trimmed.startsWith('data:')
+            ? trimmed.slice(5).trim()
+            : trimmed;
+          if (!payload || payload === '[DONE]') return;
+
+          const parsed = JSON.parse(payload);
+
+          const usage = parsed?.message?.usage || parsed?.usage;
+          if (usage) {
+            console.log(
+              `[${station.name} cache]`,
+              `input=${usage.input_tokens ?? 0}`,
+              `cache_write=${usage.cache_creation_input_tokens ?? 0}`,
+              `cache_read=${usage.cache_read_input_tokens ?? 0}`,
+              `output=${usage.output_tokens ?? 0}`
+            );
+          }
+
+          if (parsed?.type === 'error' || parsed?.error) {
+            const errObj = parsed.error || parsed;
+            const upstreamErr = new Error(
+              `[${station.name}] 流内错误: ${
+                typeof errObj === 'string' ? errObj : JSON.stringify(errObj)
+              }`
+            );
+            upstreamErr.statusCode = Number(errObj?.code) || 502;
+            upstreamErr.isFailover = !stationSentText;
+            throw upstreamErr;
+          }
+
+          const text = extractAnthropicOrProxyText(parsed);
+          if (text) {
+            if (!announcedChannel) {
+              announcedChannel = true;
+              res.write(
+                `data: ${JSON.stringify({ channel: station.name })}\n\n`
+              );
+            }
+            stationSentText = true;
+            sentAnyText = true;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          } else if (!rawSampleLogged && parsed?.type !== 'ping') {
+            rawSampleLogged = true;
+            console.log(
+              `[${station.name} event-sample]`,
+              JSON.stringify(parsed).slice(0, 300)
+            );
+          }
+        };
 
         while (true) {
           const { value, done } = await reader.read();
@@ -391,64 +492,23 @@ app.post('/api/chat', async (req, res) => {
           buffer = lines.pop() || '';
 
           for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-
             try {
-              const parsed = JSON.parse(payload);
-
-              const usage = parsed?.message?.usage || parsed?.usage;
-              if (usage) {
-                console.log(
-                  `[${station.name} cache]`,
-                  `input=${usage.input_tokens ?? 0}`,
-                  `cache_write=${usage.cache_creation_input_tokens ?? 0}`,
-                  `cache_read=${usage.cache_read_input_tokens ?? 0}`,
-                  `output=${usage.output_tokens ?? 0}`
-                );
-              }
-
-              if (parsed?.type === 'error' || parsed?.error) {
-                const errObj = parsed.error || parsed;
-                const upstreamErr = new Error(
-                  `[${station.name}] 流内错误: ${
-                    typeof errObj === 'string' ? errObj : JSON.stringify(errObj)
-                  }`
-                );
-                upstreamErr.statusCode = Number(errObj?.code) || 502;
-                upstreamErr.isFailover = !stationSentText;
-                throw upstreamErr;
-              }
-
-              let text = '';
-              if (
-                parsed?.type === 'content_block_delta' &&
-                parsed?.delta?.type === 'text_delta'
-              ) {
-                text = parsed.delta.text || '';
-              } else if (
-                typeof parsed?.choices?.[0]?.delta?.content === 'string'
-              ) {
-                text = parsed.choices[0].delta.content;
-              }
-
-              if (text) {
-                if (!announcedChannel) {
-                  announcedChannel = true;
-                  res.write(
-                    `data: ${JSON.stringify({ channel: station.name })}\n\n`
-                  );
-                }
-                stationSentText = true;
-                sentAnyText = true;
-                res.write(`data: ${JSON.stringify({ text })}\n\n`);
-              }
+              processLine(line);
             } catch (parseOrStreamErr) {
               if (parseOrStreamErr?.isFailover) {
                 throw parseOrStreamErr;
               }
+            }
+          }
+        }
+
+        // 处理流结束时缓冲区里残留的最后一行（兼容无尾部换行的响应）
+        if (buffer.trim()) {
+          try {
+            processLine(buffer);
+          } catch (parseOrStreamErr) {
+            if (parseOrStreamErr?.isFailover) {
+              throw parseOrStreamErr;
             }
           }
         }
