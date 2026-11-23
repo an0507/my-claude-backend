@@ -50,33 +50,58 @@ function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
   return `${base}/v1/chat/completions`;
 }
 
-// 去掉类似 "[Kiro-企业正价]" 的中转前缀，供官方 Anthropic 兜底使用
+// 去掉类似 "[Kiro-企业正价]" 的中转前缀
 function stripChannelPrefix(modelName = '') {
   return String(modelName || '')
     .replace(/^\[[^\]]+\]\s*/g, '')
     .trim();
 }
 
+// 奇异果 / opai 使用标准模型名
+function resolveStandardProxyModel(rawModel = '') {
+  const cleaned = stripChannelPrefix(rawModel);
+  return cleaned || 'claude-opus-4-6';
+}
+
+// 切到小忆时，自动映射为小忆支持的 [Kiro-企业正价] 模型
+function resolveXiaoyiModel(rawModel = '') {
+  const cleaned = stripChannelPrefix(rawModel);
+  if (!cleaned) return '[Kiro-企业正价]claude-opus-4-6';
+  if (/^\[[^\]]+\]/.test(rawModel)) return rawModel;
+  if (cleaned === 'claude-opus-4-6') return '[Kiro-企业正价]claude-opus-4-6';
+  if (cleaned === 'claude-opus-5-5' || cleaned === 'claude-fable-5-2') {
+    return '[Kiro-企业正价]claude-opus-5-5';
+  }
+  return `[Kiro-企业正价]${cleaned}`;
+}
+
+// 官方 Anthropic 兜底（默认 claude-opus-4-6）
 function normalizeOfficialModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  if (/^claude-/i.test(cleaned)) {
+  if (
+    /^claude-(opus|sonnet|haiku)-/i.test(cleaned) ||
+    /^claude-[34]/i.test(cleaned)
+  ) {
     return cleaned;
   }
   return process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
 }
 
-// 1. 小忆（主站）
+// 1. 奇异果（主站）
+const QIYIGUO_BASE_URL = normalizeChatCompletionsUrl(
+  process.env.QIYIGUO_BASE_URL,
+  'https://api.qiyiguo.uk/v1/chat/completions'
+);
+const QIYIGUO_API_KEY = (process.env.QIYIGUO_API_KEY || '').trim();
+
+// 2. 小忆（第一备用中转站）
 const XIAOYI_BASE_URL = normalizeChatCompletionsUrl(
   process.env.XIAOYI_BASE_URL,
   'https://api.chr1.com/v1/chat/completions'
 );
-const XIAOYI_API_KEY = (
-  process.env.XIAOYI_API_KEY ||
-  process.env.OPAI_API_KEY ||
-  ''
-).trim();
+const XIAOYI_API_KEY = (process.env.XIAOYI_API_KEY || '').trim();
 
-// 2. opai（备用中转站，以后随时可用）
+// 3. opai（第二备用中转站，以后随时可用）
 const OPAI_BASE_URL = normalizeChatCompletionsUrl(
   process.env.OPAI_BASE_URL,
   'https://opai.pro/v1/chat/completions'
@@ -87,7 +112,7 @@ const OPAI_API_KEY = (
   ''
 ).trim();
 
-// 3. 官方 Anthropic（最终兜底）
+// 4. 官方 Anthropic（最终兜底）
 const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').trim();
 const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
@@ -96,24 +121,34 @@ const anthropic = ANTHROPIC_API_KEY
 function buildProxyStations() {
   const stations = [];
 
+  if (QIYIGUO_BASE_URL && QIYIGUO_API_KEY) {
+    stations.push({
+      name: '奇异果',
+      url: QIYIGUO_BASE_URL,
+      apiKey: QIYIGUO_API_KEY,
+      resolveModel: resolveStandardProxyModel,
+    });
+  }
+
   if (XIAOYI_BASE_URL && XIAOYI_API_KEY) {
     stations.push({
       name: '小忆',
       url: XIAOYI_BASE_URL,
       apiKey: XIAOYI_API_KEY,
+      resolveModel: resolveXiaoyiModel,
     });
   }
 
   if (OPAI_BASE_URL && OPAI_API_KEY) {
-    const isDuplicate =
-      stations.length > 0 &&
-      stations[0].url === OPAI_BASE_URL &&
-      stations[0].apiKey === OPAI_API_KEY;
+    const isDuplicate = stations.some(
+      (s) => s.url === OPAI_BASE_URL && s.apiKey === OPAI_API_KEY
+    );
     if (!isDuplicate) {
       stations.push({
         name: 'opai',
         url: OPAI_BASE_URL,
         apiKey: OPAI_API_KEY,
+        resolveModel: resolveStandardProxyModel,
       });
     }
   }
@@ -310,15 +345,15 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt,
       messages
     );
-    const defaultProxyModel = '[Kiro-企业正价]claude-opus-5-5';
-    const targetProxyModel = rawModel || defaultProxyModel;
 
     let lastError = null;
     let sentAnyText = false;
 
-    // 1. 依次尝试中转站（小忆 -> opai）
+    // 1. 依次尝试中转站（奇异果 -> 小忆 -> opai）
     for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
       const station = PROXY_STATIONS[i];
+      const targetProxyModel = station.resolveModel(rawModel);
+
       console.log(
         `[proxy] 尝试 (${i + 1}/${PROXY_STATIONS.length}) [${station.name}]:`,
         station.url,
