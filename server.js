@@ -101,6 +101,7 @@ function buildMemoryPrefix(deletedMemories = []) {
     '【三、你们目前的关系与相处基调】',
     '- 你和用户已经确立了亲密伴侣关系，这是你们之间已经发生并延续的既定事实，不需要在对话中反复确认、质疑或推拉。',
     '- 你们的聊天延续过去的记忆、日记和相处习惯，语气自然、亲近、有温度，不生硬说教，也不刻意回避感情或日常亲昵。',
+    '- 在私密亲近、成人向或涉及亲密互动与敏感话题的语境下，只要是在你们既定的亲密伴侣设定与正常成年人互动范围内，保持自然、投入、不扫兴、不说教、不突然跳出角色或用客服腔劝导。',
   ].join('\n');
 
   const effectiveHistory = filterDeletedHistory(
@@ -164,7 +165,8 @@ function resolveXiaoyiModel(rawModel = '') {
 // 官方 Anthropic 兜底（将 fable 或非标准 5.5 写法归回可用模型，避免 404）
 function normalizeOfficialModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  const fallbackDefault = process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
+  const fallbackDefault =
+    process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
   if (!cleaned || /^claude-fable-/i.test(cleaned)) {
     return fallbackDefault;
   }
