@@ -138,18 +138,19 @@ function stripChannelPrefix(modelName = '') {
     .trim();
 }
 
-// opai / 奇异果 / 幕间 使用标准模型名
+// opai / 奇异果 / 幕间 使用标准或中转模型名（默认 claude-fable-5-1）
 function resolveStandardProxyModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  return cleaned || 'claude-opus-4-6';
+  if (!cleaned) return 'claude-fable-5-1';
+  if (cleaned === 'claude-opus-5.5') return 'claude-opus-5-5';
+  return cleaned;
 }
 
 // 切到小忆时，自动映射为小忆支持的 [Kiro-企业正价] 模型
 function resolveXiaoyiModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
-  if (!cleaned) return '[Kiro-企业正价]claude-opus-4-6';
+  if (!cleaned) return '[Kiro-企业正价]claude-fable-5-1';
   if (/^\[[^\]]+\]/.test(rawModel)) return rawModel;
-  if (cleaned === 'claude-opus-4-6') return '[Kiro-企业正价]claude-opus-4-6';
   if (
     cleaned === 'claude-opus-5-5' ||
     cleaned === 'claude-opus-5.5' ||
@@ -160,16 +161,23 @@ function resolveXiaoyiModel(rawModel = '') {
   return `[Kiro-企业正价]${cleaned}`;
 }
 
-// 官方 Anthropic 兜底（默认 claude-opus-4-6）
+// 官方 Anthropic 兜底（将 fable 或非标准 5.5 写法归回可用模型，避免 404）
 function normalizeOfficialModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
+  const fallbackDefault = process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
+  if (!cleaned || /^claude-fable-/i.test(cleaned)) {
+    return fallbackDefault;
+  }
+  if (cleaned === 'claude-opus-5.5') {
+    return 'claude-opus-5-5';
+  }
   if (
     /^claude-(opus|sonnet|haiku)-/i.test(cleaned) ||
     /^claude-[34]/i.test(cleaned)
   ) {
     return cleaned;
   }
-  return process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
+  return fallbackDefault;
 }
 
 // 兼容提取 Anthropic 原生流 / 非流 / OpenAI 兼容流里的文本增量
