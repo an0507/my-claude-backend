@@ -42,7 +42,7 @@ function buildMemoryPrefix() {
   ].join('\n\n');
 }
 
-// 默认走中转通道（如 OPAi / QimingX）；如需走官方直连，可在环境变量设置 PROVIDER=anthropic
+// 默认走中转通道（如小忆 API / OPAi）；如需走官方直连，可在环境变量设置 PROVIDER=anthropic
 const PROVIDER = (process.env.PROVIDER || 'proxy').toLowerCase();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -60,9 +60,12 @@ function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
   return `${base}/v1/chat/completions`;
 }
 
+// 优先读取 OPAI_BASE_URL / OPENAI_BASE_URL，默认走小忆 API 地址
 const PROXY_BASE_URL = normalizeChatCompletionsUrl(
-  process.env.OPAI_BASE_URL || process.env.QIMINGX_BASE_URL,
-  'https://opai.pro/v1/chat/completions'
+  process.env.OPAI_BASE_URL ||
+    process.env.OPENAI_BASE_URL ||
+    process.env.QIMINGX_BASE_URL,
+  'https://api.chr1.com/v1/chat/completions'
 );
 
 const anthropic = ANTHROPIC_API_KEY
@@ -184,6 +187,7 @@ app.get('/health', (req, res) => {
     ok: true,
     status: 'running',
     provider: PROVIDER,
+    proxyBaseUrl: PROXY_BASE_URL,
     hasHistoryMemory: Boolean(cleanedChatHistory),
     historyChars: cleanedChatHistory.length,
   });
@@ -215,10 +219,10 @@ app.post('/api/chat', async (req, res) => {
         throw new Error('缺少 ANTHROPIC_API_KEY 环境变量');
       }
 
-      const looksLikeOfficialModel = /^claude-/i.test(rawModel);
+      const looksLikeOfficialModel = /^(?:\[[^\]]+\])?claude-/i.test(rawModel);
       const selectedModel = looksLikeOfficialModel
         ? rawModel
-        : process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-sonnet-4-5';
+        : process.env.ANTHROPIC_DEFAULT_MODEL || '[Kiro-企业正价]claude-opus-5-5';
 
       console.log(
         '[anthropic] 前端模型:',
@@ -272,7 +276,9 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const selectedProxyModel =
-      rawModel || process.env.PROXY_DEFAULT_MODEL || 'claude-sonnet-4-5';
+      rawModel ||
+      process.env.PROXY_DEFAULT_MODEL ||
+      '[Kiro-企业正价]claude-opus-5-5';
 
     console.log(
       '[proxy] 端点:',
