@@ -212,6 +212,21 @@ app.post('/api/chat', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+
+  // 每 5 秒发送一次 SSE 心跳注释，防止手机浏览器或网关在首字返回前断开连接
+  res.write(': ping\n\n');
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': ping\n\n');
+    }
+  }, 5000);
+
+  const cleanup = () => clearInterval(heartbeat);
+  req.on('close', cleanup);
 
   try {
     if (PROVIDER === 'anthropic') {
@@ -265,6 +280,7 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
+      cleanup();
       res.write('data: [DONE]\n\n');
       return res.end();
     }
@@ -351,9 +367,11 @@ app.post('/api/chat', async (req, res) => {
       res.write(`data: ${JSON.stringify({ text: '' })}\n\n`);
     }
 
+    cleanup();
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err) {
+    cleanup();
     console.error(err);
     const msg = err?.message || '出错了，请稍后再试';
     res.write(`data: ${JSON.stringify({ error: msg })}\n\n`);
