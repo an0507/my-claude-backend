@@ -42,16 +42,6 @@ function buildMemoryPrefix() {
   ].join('\n\n');
 }
 
-// 默认走中转通道（如小忆 API / OPAi）；如需走官方直连，可在环境变量设置 PROVIDER=anthropic
-const PROVIDER = (process.env.PROVIDER || 'proxy').toLowerCase();
-
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const PROXY_API_KEY =
-  process.env.OPAI_API_KEY ||
-  process.env.QIMINGX_API_KEY ||
-  process.env.OPENAI_API_KEY ||
-  '';
-
 function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
   const base = (rawUrl || fallbackUrl || '').trim().replace(/\/+$/, '');
   if (!base) return '';
@@ -60,17 +50,84 @@ function normalizeChatCompletionsUrl(rawUrl, fallbackUrl) {
   return `${base}/v1/chat/completions`;
 }
 
-// 优先读取 OPAI_BASE_URL / OPENAI_BASE_URL，默认走小忆 API 地址
-const PROXY_BASE_URL = normalizeChatCompletionsUrl(
-  process.env.OPAI_BASE_URL ||
-    process.env.OPENAI_BASE_URL ||
-    process.env.QIMINGX_BASE_URL,
+// 去掉类似 "[Kiro-企业正价]" 的中转前缀，供官方 Anthropic 兜底使用
+function stripChannelPrefix(modelName = '') {
+  return String(modelName || '')
+    .replace(/^\[[^\]]+\]\s*/g, '')
+    .trim();
+}
+
+function normalizeOfficialModel(rawModel = '') {
+  const cleaned = stripChannelPrefix(rawModel);
+  if (/^claude-/i.test(cleaned)) {
+    return cleaned;
+  }
+  return process.env.ANTHROPIC_DEFAULT_MODEL || 'claude-opus-4-6';
+}
+
+// 1. 小忆（主站）
+const XIAOYI_BASE_URL = normalizeChatCompletionsUrl(
+  process.env.XIAOYI_BASE_URL,
   'https://api.chr1.com/v1/chat/completions'
 );
+const XIAOYI_API_KEY = (
+  process.env.XIAOYI_API_KEY ||
+  process.env.OPAI_API_KEY ||
+  ''
+).trim();
 
+// 2. opai（备用中转站，以后随时可用）
+const OPAI_BASE_URL = normalizeChatCompletionsUrl(
+  process.env.OPAI_BASE_URL,
+  'https://opai.pro/v1/chat/completions'
+);
+const OPAI_API_KEY = (
+  process.env.OPAI_BACKUP_API_KEY ||
+  process.env.OPAI_API_KEY ||
+  ''
+).trim();
+
+// 3. 官方 Anthropic（最终兜底）
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').trim();
 const anthropic = ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
   : null;
+
+function buildProxyStations() {
+  const stations = [];
+
+  if (XIAOYI_BASE_URL && XIAOYI_API_KEY) {
+    stations.push({
+      name: '小忆',
+      url: XIAOYI_BASE_URL,
+      apiKey: XIAOYI_API_KEY,
+    });
+  }
+
+  if (OPAI_BASE_URL && OPAI_API_KEY) {
+    const isDuplicate =
+      stations.length > 0 &&
+      stations[0].url === OPAI_BASE_URL &&
+      stations[0].apiKey === OPAI_API_KEY;
+    if (!isDuplicate) {
+      stations.push({
+        name: 'opai',
+        url: OPAI_BASE_URL,
+        apiKey: OPAI_API_KEY,
+      });
+    }
+  }
+
+  return stations;
+}
+
+const PROXY_STATIONS = buildProxyStations();
+console.log(
+  '[channels] 中转顺位:',
+  PROXY_STATIONS.map((s) => `${s.name}(${s.url})`).join(' -> ') || '无',
+  '| 官方兜底:',
+  anthropic ? '已启用(claude-opus-4-6)' : '未配置'
+);
 
 function extractDeltaText(delta) {
   if (!delta) return '';
@@ -182,12 +239,32 @@ function buildProxyMessages(memoryPrefix, systemPrompt, messages) {
   return [...prefixMessages, ...messages];
 }
 
+function isFailoverError(err) {
+  if (!err) return false;
+  if (err.isFailover === true) return true;
+  const status = Number(err.statusCode || 0);
+  if ([408, 429, 500, 502, 503, 504].includes(status)) return true;
+  const msg = String(err.message || '').toLowerCase();
+  return (
+    msg.includes('502') ||
+    msg.includes('503') ||
+    msg.includes('504') ||
+    msg.includes('429') ||
+    msg.includes('服务暂时不可用') ||
+    msg.includes('fetch failed') ||
+    msg.includes('network') ||
+    msg.includes('timeout') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout')
+  );
+}
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     ok: true,
     status: 'running',
-    provider: PROVIDER,
-    proxyBaseUrl: PROXY_BASE_URL,
+    proxyStations: PROXY_STATIONS.map((s) => s.name),
+    hasAnthropicFallback: Boolean(anthropic),
     hasHistoryMemory: Boolean(cleanedChatHistory),
     historyChars: cleanedChatHistory.length,
   });
@@ -217,7 +294,6 @@ app.post('/api/chat', async (req, res) => {
     res.flushHeaders();
   }
 
-  // 每 5 秒发送一次 SSE 心跳注释，防止手机浏览器或网关在首字返回前断开连接
   res.write(': ping\n\n');
   const heartbeat = setInterval(() => {
     if (!res.writableEnded) {
@@ -229,28 +305,154 @@ app.post('/api/chat', async (req, res) => {
   req.on('close', cleanup);
 
   try {
-    if (PROVIDER === 'anthropic') {
-      if (!anthropic) {
-        throw new Error('缺少 ANTHROPIC_API_KEY 环境变量');
-      }
+    const formattedMessages = buildProxyMessages(
+      memoryPrefix,
+      systemPrompt,
+      messages
+    );
+    const defaultProxyModel = '[Kiro-企业正价]claude-opus-5-5';
+    const targetProxyModel = rawModel || defaultProxyModel;
 
-      const looksLikeOfficialModel = /^(?:\[[^\]]+\])?claude-/i.test(rawModel);
-      const selectedModel = looksLikeOfficialModel
-        ? rawModel
-        : process.env.ANTHROPIC_DEFAULT_MODEL || '[Kiro-企业正价]claude-opus-5-5';
+    let lastError = null;
+    let sentAnyText = false;
 
+    // 1. 依次尝试中转站（小忆 -> opai）
+    for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
+      const station = PROXY_STATIONS[i];
       console.log(
-        '[anthropic] 前端模型:',
-        rawModel || '(空)',
-        '| 实际请求:',
-        selectedModel
+        `[proxy] 尝试 (${i + 1}/${PROXY_STATIONS.length}) [${station.name}]:`,
+        station.url,
+        '| 模型:',
+        targetProxyModel
       );
+
+      try {
+        const resp = await fetch(station.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${station.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: targetProxyModel,
+            messages: formattedMessages,
+            max_tokens: resolvedMaxTokens,
+            stream: true,
+          }),
+        });
+
+        if (!resp.ok) {
+          const errText = await resp.text();
+          const err = new Error(
+            `[${station.name}] 上游接口错误 ${resp.status}: ${errText}`
+          );
+          err.statusCode = resp.status;
+          throw err;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let stationSentText = false;
+        let announcedChannel = false;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data:')) continue;
+            const payload = trimmed.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(payload);
+              if (parsed?.error) {
+                const upstreamErr = new Error(
+                  `[${station.name}] 流内错误: ${
+                    typeof parsed.error === 'string'
+                      ? parsed.error
+                      : JSON.stringify(parsed.error)
+                  }`
+                );
+                upstreamErr.statusCode = Number(parsed.error?.code) || 502;
+                upstreamErr.isFailover = !stationSentText;
+                throw upstreamErr;
+              }
+
+              const text =
+                extractDeltaText(parsed?.choices?.[0]?.delta) ||
+                parsed?.choices?.[0]?.message?.content ||
+                '';
+              if (text) {
+                if (!announcedChannel) {
+                  announcedChannel = true;
+                  res.write(
+                    `data: ${JSON.stringify({ channel: station.name })}\n\n`
+                  );
+                }
+                stationSentText = true;
+                sentAnyText = true;
+                res.write(`data: ${JSON.stringify({ text })}\n\n`);
+              }
+            } catch (parseOrStreamErr) {
+              if (parseOrStreamErr?.isFailover) {
+                throw parseOrStreamErr;
+              }
+            }
+          }
+        }
+
+        const hasMoreStation =
+          i < PROXY_STATIONS.length - 1 || Boolean(anthropic);
+        if (!stationSentText && hasMoreStation) {
+          const emptyErr = new Error(
+            `[${station.name}] 未返回有效内容，尝试下一个渠道`
+          );
+          emptyErr.isFailover = true;
+          throw emptyErr;
+        }
+
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[failover] ${station.name} 失败:`, err.message);
+
+        const hasMoreStation =
+          i < PROXY_STATIONS.length - 1 || Boolean(anthropic);
+        if (!sentAnyText && hasMoreStation && isFailoverError(err)) {
+          const nextName =
+            i < PROXY_STATIONS.length - 1
+              ? PROXY_STATIONS[i + 1].name
+              : '官方兜底';
+          console.log(`[failover] 自动切换到: ${nextName}`);
+          continue;
+        }
+
+        if (i === PROXY_STATIONS.length - 1 && anthropic && !sentAnyText) {
+          break;
+        }
+        throw err;
+      }
+    }
+
+    // 2. 若中转站全部失败且尚未吐字，走官方 Anthropic 兜底（默认 claude-opus-4-6）
+    if (!sentAnyText && anthropic) {
+      const officialModel = normalizeOfficialModel(rawModel);
+      console.log('[anthropic-fallback] 启用官方兜底，模型:', officialModel);
+      res.write(`data: ${JSON.stringify({ channel: '官方兜底' })}\n\n`);
 
       const payload = buildCachedAnthropicPayload(
         memoryPrefix,
         systemPrompt,
         messages,
-        selectedModel,
+        officialModel,
         resolvedMaxTokens
       );
 
@@ -276,91 +478,15 @@ app.post('/api/chat', async (req, res) => {
           event.delta &&
           event.delta.type === 'text_delta'
         ) {
+          sentAnyText = true;
           res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
         }
       }
-
-      cleanup();
-      res.write('data: [DONE]\n\n');
-      return res.end();
+      lastError = null;
     }
 
-    if (!PROXY_API_KEY) {
-      throw new Error(
-        '缺少 OPAI_API_KEY（或 QIMINGX_API_KEY / OPENAI_API_KEY）环境变量'
-      );
-    }
-
-    const selectedProxyModel =
-      rawModel ||
-      process.env.PROXY_DEFAULT_MODEL ||
-      '[Kiro-企业正价]claude-opus-5-5';
-
-    console.log(
-      '[proxy] 端点:',
-      PROXY_BASE_URL,
-      '| 前端模型:',
-      rawModel || '(空)',
-      '| 实际请求:',
-      selectedProxyModel
-    );
-
-    const formattedMessages = buildProxyMessages(
-      memoryPrefix,
-      systemPrompt,
-      messages
-    );
-
-    const resp = await fetch(PROXY_BASE_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${PROXY_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: selectedProxyModel,
-        messages: formattedMessages,
-        max_tokens: resolvedMaxTokens,
-        stream: true,
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`上游接口错误 ${resp.status}: ${errText}`);
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let sentAnyText = false;
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data:')) continue;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-
-        try {
-          const parsed = JSON.parse(payload);
-          const text =
-            extractDeltaText(parsed?.choices?.[0]?.delta) ||
-            parsed?.choices?.[0]?.message?.content ||
-            '';
-          if (text) {
-            sentAnyText = true;
-            res.write(`data: ${JSON.stringify({ text })}\n\n`);
-          }
-        } catch (_) {}
-      }
+    if (lastError && !sentAnyText) {
+      throw lastError;
     }
 
     if (!sentAnyText) {
@@ -381,5 +507,5 @@ app.post('/api/chat', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`服务器已启动，端口 ${PORT}，当前通道: ${PROVIDER}`);
+  console.log(`服务器已启动，端口 ${PORT}`);
 });
