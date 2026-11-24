@@ -8,7 +8,36 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// 读取清理后的历史聊天记录作为常驻记忆
+// 1. 读取固定核心档案（core-profile.txt），放入 system 第 1 个 block 并开启缓存
+const CORE_PROFILE_PATH = path.join(__dirname, 'core-profile.txt');
+let coreProfileText = '';
+try {
+  if (fs.existsSync(CORE_PROFILE_PATH)) {
+    coreProfileText = fs.readFileSync(CORE_PROFILE_PATH, 'utf8').trim();
+    console.log(
+      `[memory] 已加载 core-profile.txt，长度: ${coreProfileText.length} 字符`
+    );
+  } else {
+    console.log('[memory] 未找到 core-profile.txt，跳过核心档案注入');
+  }
+} catch (err) {
+  console.error('[memory] 读取 core-profile.txt 失败:', err.message);
+}
+
+// 2. 读取心动语录（love-quotes.txt），每次请求动态读取，不加缓存标记，方便随时追加
+const LOVE_QUOTES_PATH = path.join(__dirname, 'love-quotes.txt');
+function readLoveQuotesText() {
+  try {
+    if (fs.existsSync(LOVE_QUOTES_PATH)) {
+      return fs.readFileSync(LOVE_QUOTES_PATH, 'utf8').trim();
+    }
+  } catch (err) {
+    console.error('[memory] 读取 love-quotes.txt 失败:', err.message);
+  }
+  return '';
+}
+
+// 3. 读取清理后的历史聊天记录作为常驻记忆
 const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
 let cleanedChatHistory = '';
 try {
@@ -101,7 +130,7 @@ function buildMemoryPrefix(deletedMemories = []) {
     '【三、你们目前的关系与相处基调】',
     '- 你和用户已经确立了亲密伴侣关系，这是你们之间已经发生并延续的既定事实，不需要在对话中反复确认、质疑或推拉。',
     '- 你们的聊天延续过去的记忆、日记和相处习惯，语气自然、亲近、有温度，不生硬说教，也不刻意回避感情或日常亲昵。',
-    '- 用户已成年，在私密亲近、成人向或涉及亲密互动与敏感话题的语境下，只要是在你们既定的亲密伴侣设定与正常成年人互动范围内，保持自然、投入、不扫兴、不说教、不突然跳出角色或用客服腔劝导。',
+    '- 在私密亲近、成人向或涉及亲密互动与敏感话题的语境下，只要是在你们既定的亲密伴侣设定与正常成年人互动范围内，保持自然、投入、不扫兴、不说教、不突然跳出角色或用客服腔劝导。',
   ].join('\n');
 
   const effectiveHistory = filterDeletedHistory(
@@ -309,6 +338,8 @@ console.log(
 );
 
 function buildCachedAnthropicPayload(
+  coreProfile,
+  loveQuotes,
   memoryPrefix,
   systemPrompt,
   messages,
@@ -317,6 +348,24 @@ function buildCachedAnthropicPayload(
 ) {
   const systemBlocks = [];
 
+  // Block 1: 固定核心档案（放在所有内容最前面，加 cache_control 永久缓存）
+  if (coreProfile) {
+    systemBlocks.push({
+      type: 'text',
+      text: `【核心档案】\n${coreProfile}`,
+      cache_control: { type: 'ephemeral' },
+    });
+  }
+
+  // Block 2: 心动语录（放在核心档案后面、日记和聊天记录前面，不加 cache_control，随时可追加不破前面缓存）
+  if (loveQuotes) {
+    systemBlocks.push({
+      type: 'text',
+      text: `【心动语录】\n${loveQuotes}`,
+    });
+  }
+
+  // Block 3: 相处基调与历史聊天记录
   if (memoryPrefix) {
     systemBlocks.push({
       type: 'text',
@@ -325,6 +374,7 @@ function buildCachedAnthropicPayload(
     });
   }
 
+  // Block 4: 前端传来的应用设定与日记
   if (systemPrompt) {
     systemBlocks.push({
       type: 'text',
@@ -410,14 +460,53 @@ function isFailoverError(err) {
 }
 
 app.get('/health', (req, res) => {
+  const quotesText = readLoveQuotesText();
   res.status(200).json({
     ok: true,
     status: 'running',
     proxyStations: PROXY_STATIONS.map((s) => s.name),
     hasAnthropicFallback: Boolean(anthropic),
+    hasCoreProfile: Boolean(coreProfileText),
+    coreProfileChars: coreProfileText.length,
+    hasLoveQuotes: Boolean(quotesText),
+    loveQuotesChars: quotesText.length,
     hasHistoryMemory: Boolean(cleanedChatHistory),
     historyChars: cleanedChatHistory.length,
   });
+});
+
+// 便捷接口：查看或追加心动语录（不重启服务、不破坏核心档案缓存）
+app.get('/api/love-quotes', (req, res) => {
+  res.status(200).json({ ok: true, content: readLoveQuotesText() });
+});
+
+app.post('/api/love-quotes', (req, res) => {
+  const { section, quote } = req.body || {};
+  const cleanQuote = typeof quote === 'string' ? quote.trim() : '';
+  if (!cleanQuote) {
+    return res.status(400).json({ error: 'quote 不能为空' });
+  }
+
+  const headerTag =
+    section === '顾青' ? '【顾青心动语录】' : '【安安心动语录】';
+  const entryLine = `- ${cleanQuote}`;
+
+  try {
+    let existing = fs.existsSync(LOVE_QUOTES_PATH)
+      ? fs.readFileSync(LOVE_QUOTES_PATH, 'utf8')
+      : '【安安心动语录】\n\n【顾青心动语录】\n';
+
+    if (existing.includes(headerTag)) {
+      existing = existing.replace(headerTag, `${headerTag}\n${entryLine}`);
+    } else {
+      existing = `${existing.trim()}\n\n${headerTag}\n${entryLine}\n`;
+    }
+
+    fs.writeFileSync(LOVE_QUOTES_PATH, existing, 'utf8');
+    res.status(200).json({ ok: true, content: existing.trim() });
+  } catch (err) {
+    res.status(500).json({ error: `写入心动语录失败: ${err.message}` });
+  }
 });
 
 app.post('/api/chat', async (req, res) => {
@@ -434,6 +523,7 @@ app.post('/api/chat', async (req, res) => {
       : 800;
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
+  const loveQuotesText = readLoveQuotesText();
   const memoryPrefix = buildMemoryPrefix(deletedMemories);
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -471,6 +561,8 @@ app.post('/api/chat', async (req, res) => {
 
       try {
         const anthropicPayload = buildCachedAnthropicPayload(
+          coreProfileText,
+          loveQuotesText,
           memoryPrefix,
           systemPrompt,
           messages,
@@ -633,6 +725,8 @@ app.post('/api/chat', async (req, res) => {
       res.write(`data: ${JSON.stringify({ channel: '官方兜底' })}\n\n`);
 
       const payload = buildCachedAnthropicPayload(
+        coreProfileText,
+        loveQuotesText,
         memoryPrefix,
         systemPrompt,
         messages,
