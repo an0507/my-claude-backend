@@ -268,7 +268,6 @@ function extractClaudeQuoteActions(rawText = '') {
   const text = String(rawText || '');
   const actions = [];
 
-  // 1. 新增：[[记顾青语录: 句子]] 或 [[记顾青语录|11.24: 句子]]
   const addMatches = [
     ...text.matchAll(
       /\[\[\s*记顾青语录(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*\]\]/gi
@@ -285,7 +284,6 @@ function extractClaudeQuoteActions(rawText = '') {
     }
   }
 
-  // 2. 修改：[[改顾青语录|11.24: 旧句子 => 新句子]] 或 [[改顾青语录: 旧句子 => 新句子]]
   const editMatches = [
     ...text.matchAll(
       /\[\[\s*改顾青语录(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*(?:=>|->|→)\s*([\s\S]*?)\s*\]\]/gi
@@ -304,7 +302,6 @@ function extractClaudeQuoteActions(rawText = '') {
     }
   }
 
-  // 3. 删除：[[删顾青语录|11.24: 要删的句子]] 或 [[删顾青语录: 要删的句子]]
   const deleteMatches = [
     ...text.matchAll(
       /\[\[\s*删顾青语录(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*\]\]/gi
@@ -321,7 +318,6 @@ function extractClaudeQuoteActions(rawText = '') {
     }
   }
 
-  // 4. 整段重写顾青分类：[[重写顾青语录: 新段落内容]]
   const replaceMatches = [
     ...text.matchAll(
       /\[\[\s*重写顾青语录\s*:\s*([\s\S]*?)\s*\]\]/gi
@@ -716,6 +712,7 @@ console.log(
   anthropic ? '已启用(claude-opus-4-6)' : '未配置'
 );
 
+// 只在最前面固定核心档案处放 1 个缓存断点，避免后续内容变动频繁失效重写
 function buildCachedAnthropicPayload(
   coreProfile,
   loveQuotes,
@@ -727,7 +724,6 @@ function buildCachedAnthropicPayload(
 ) {
   const systemBlocks = [];
 
-  // Block 1: 固定核心档案（放在所有内容最前面，加 cache_control 缓存）
   if (coreProfile) {
     systemBlocks.push({
       type: 'text',
@@ -736,7 +732,6 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  // Block 2: 心动语录（放在核心档案后面、日记和聊天记录前面，不加 cache_control，随时可追加/编辑不破前面缓存）
   if (loveQuotes) {
     systemBlocks.push({
       type: 'text',
@@ -744,64 +739,23 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  // Block 3: 相处基调、语录权限与历史聊天记录
   if (memoryPrefix) {
     systemBlocks.push({
       type: 'text',
       text: memoryPrefix,
-      cache_control: { type: 'ephemeral' },
     });
   }
 
-  // Block 4: 前端传来的应用设定与日记
   if (systemPrompt) {
     systemBlocks.push({
       type: 'text',
       text: systemPrompt,
-      cache_control: { type: 'ephemeral' },
     });
   }
 
   const formattedMessages = messages
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
-    .map((msg, idx, arr) => {
-      const isSecondLast = arr.length >= 2 && idx === arr.length - 2;
-      if (!isSecondLast) return msg;
-
-      if (typeof msg.content === 'string') {
-        return {
-          ...msg,
-          content: [
-            {
-              type: 'text',
-              text: msg.content,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        };
-      }
-
-      if (Array.isArray(msg.content) && msg.content.length > 0) {
-        const cloned = [...msg.content];
-        const lastIdx = cloned.length - 1;
-        const lastItem = cloned[lastIdx];
-        if (typeof lastItem === 'string') {
-          cloned[lastIdx] = {
-            type: 'text',
-            text: lastItem,
-            cache_control: { type: 'ephemeral' },
-          };
-        } else if (lastItem && typeof lastItem === 'object') {
-          cloned[lastIdx] = {
-            ...lastItem,
-            cache_control: { type: 'ephemeral' },
-          };
-        }
-        return { ...msg, content: cloned };
-      }
-
-      return msg;
-    });
+    .map((msg) => msg);
 
   return {
     model,
