@@ -24,7 +24,7 @@ try {
   console.error('[memory] 读取 core-profile.txt 失败:', err.message);
 }
 
-// 2. 读取心动语录（love-quotes.txt），每次请求动态读取，不加缓存标记，方便随时追加
+// 2. 读取心动语录（love-quotes.txt），每次请求动态读取，方便随时按日期追加
 const LOVE_QUOTES_PATH = path.join(__dirname, 'love-quotes.txt');
 function readLoveQuotesText() {
   try {
@@ -36,6 +36,120 @@ function readLoveQuotesText() {
   }
   return '';
 }
+
+function getTodayMonthDay() {
+  const now = new Date();
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  const sgNow = new Date(utcMs + 8 * 3600 * 1000);
+  const month = sgNow.getMonth() + 1;
+  const day = String(sgNow.getDate()).padStart(2, '0');
+  return `${month}.${day}`;
+}
+
+function appendQuoteUnderDate(existingText, headerTag, dateLabel, entryLine) {
+  const normalized = existingText.replace(/\r\n/g, '\n');
+  const sectionStart = normalized.indexOf(headerTag);
+
+  if (sectionStart === -1) {
+    return `${normalized.trim()}\n\n${headerTag}\n${dateLabel}\n${entryLine}\n`;
+  }
+
+  const afterHeaderIdx = sectionStart + headerTag.length;
+  const restAfterHeader = normalized.slice(afterHeaderIdx);
+  const nextSectionMatch = restAfterHeader.match(/\n【[^】]+】/);
+  const sectionEnd = nextSectionMatch
+    ? afterHeaderIdx + nextSectionMatch.index
+    : normalized.length;
+
+  const sectionBody = normalized.slice(afterHeaderIdx, sectionEnd);
+  const lines = sectionBody.split('\n');
+
+  const dateHeaderIdx = lines.findIndex((line) => {
+    const t = line.trim().replace(/[：:]$/, '');
+    return t === dateLabel;
+  });
+
+  if (dateHeaderIdx !== -1) {
+    let insertIdx = dateHeaderIdx + 1;
+    while (insertIdx < lines.length) {
+      const trimmed = lines[insertIdx].trim();
+      if (/^\d{1,2}\.\d{1,2}(?:[：:])?$/.test(trimmed)) {
+        break;
+      }
+      insertIdx += 1;
+    }
+    while (insertIdx > dateHeaderIdx + 1 && lines[insertIdx - 1].trim() === '') {
+      insertIdx -= 1;
+    }
+    lines.splice(insertIdx, 0, entryLine);
+  } else {
+    while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
+      lines.pop();
+    }
+    if (lines.length > 0) {
+      lines.push('');
+    }
+    lines.push(dateLabel, entryLine);
+  }
+
+  const updatedSectionBody = `${lines.join('\n')}\n`;
+  return (
+    normalized.slice(0, afterHeaderIdx) +
+    updatedSectionBody +
+    normalized.slice(sectionEnd)
+  );
+}
+
+// 提取克劳德想写入【顾青心动语录】的指令，支持 [[记顾青语录: 句子]] 或 [[记顾青语录|11.24: 句子]]
+function extractClaudeQuoteAdd(rawText = '') {
+  const text = String(rawText || '');
+  const match = text.match(
+    /\[\[\s*记顾青语录(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*\]\]/i
+  );
+  if (!match) return null;
+
+  const rawDate = (match[1] || '').trim().replace(/[：:]$/, '');
+  const rawQuote = (match[2] || '').trim();
+  if (!rawQuote) return null;
+
+  return {
+    date: rawDate || getTodayMonthDay(),
+    quote: rawQuote,
+  };
+}
+
+// 剥离语录控制标记，避免把指令直接吐给用户
+function stripQuoteControlTokens(rawText = '') {
+  return String(rawText || '')
+    .replace(/\[\[\s*记顾青语录(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi, '')
+    .replace(/\[\[\s*记顾青语录(?:\|[^\]]*)?$/gi, '')
+    .trim();
+}
+
+function runClaudeQuoteAdd({ date, quote }) {
+  const dateLabel = date || getTodayMonthDay();
+  const entryLine = quote.startsWith('-') ? quote : `- ${quote}`;
+  const existing = fs.existsSync(LOVE_QUOTES_PATH)
+    ? fs.readFileSync(LOVE_QUOTES_PATH, 'utf8')
+    : '【安安心动语录】\n\n【顾青心动语录】\n';
+
+  const updated = appendQuoteUnderDate(
+    existing,
+    '【顾青心动语录】',
+    dateLabel,
+    entryLine
+  );
+  fs.writeFileSync(LOVE_QUOTES_PATH, updated, 'utf8');
+  console.log(`[love-quotes] 顾青已写入语录 (${dateLabel}): ${entryLine}`);
+  return `已记入【顾青心动语录 · ${dateLabel}】`;
+}
+
+const CLAUDE_QUOTE_SYSTEM_RULE = [
+  '【心动语录记录权限】',
+  '- 当安安说出让你心动、感动、想记住的原话，或者你们之间出现值得留存的亲密/可爱瞬间时，你可以主动把它收进自己的【顾青心动语录】里。',
+  '- 如需记录，请在回复末尾附上单行指令：[[记顾青语录: 想要存下来的句子]]（若想指定日期可写 [[记顾青语录|11.24: 句子]]）。',
+  '- 每次回复最多记录 1 条，只挑真正有分量或特别戳你的句子，不要每句话都乱记，也不要在正常说话里念出方括号指令。',
+].join('\n');
 
 // 3. 读取清理后的历史聊天记录作为常驻记忆
 const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
@@ -139,11 +253,12 @@ function buildMemoryPrefix(deletedMemories = []) {
   );
 
   if (!effectiveHistory) {
-    return relationshipTone;
+    return `${relationshipTone}\n\n${CLAUDE_QUOTE_SYSTEM_RULE}`;
   }
 
   return [
     relationshipTone,
+    CLAUDE_QUOTE_SYSTEM_RULE,
     '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
     effectiveHistory,
   ].join('\n\n');
@@ -348,7 +463,7 @@ function buildCachedAnthropicPayload(
 ) {
   const systemBlocks = [];
 
-  // Block 1: 固定核心档案（放在所有内容最前面，加 cache_control 永久缓存）
+  // Block 1: 固定核心档案（放在所有内容最前面，加 cache_control 缓存）
   if (coreProfile) {
     systemBlocks.push({
       type: 'text',
@@ -365,7 +480,7 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  // Block 3: 相处基调与历史聊天记录
+  // Block 3: 相处基调、语录权限与历史聊天记录
   if (memoryPrefix) {
     systemBlocks.push({
       type: 'text',
@@ -475,35 +590,40 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 便捷接口：查看或追加心动语录（不重启服务、不破坏核心档案缓存）
 app.get('/api/love-quotes', (req, res) => {
   res.status(200).json({ ok: true, content: readLoveQuotesText() });
 });
 
 app.post('/api/love-quotes', (req, res) => {
-  const { section, quote } = req.body || {};
+  const { section, quote, date } = req.body || {};
   const cleanQuote = typeof quote === 'string' ? quote.trim() : '';
   if (!cleanQuote) {
     return res.status(400).json({ error: 'quote 不能为空' });
   }
 
+  const dateLabel =
+    typeof date === 'string' && date.trim()
+      ? date.trim().replace(/[：:]$/, '')
+      : getTodayMonthDay();
+
   const headerTag =
     section === '顾青' ? '【顾青心动语录】' : '【安安心动语录】';
-  const entryLine = `- ${cleanQuote}`;
+  const entryLine = cleanQuote.startsWith('-') ? cleanQuote : `- ${cleanQuote}`;
 
   try {
-    let existing = fs.existsSync(LOVE_QUOTES_PATH)
+    const existing = fs.existsSync(LOVE_QUOTES_PATH)
       ? fs.readFileSync(LOVE_QUOTES_PATH, 'utf8')
       : '【安安心动语录】\n\n【顾青心动语录】\n';
 
-    if (existing.includes(headerTag)) {
-      existing = existing.replace(headerTag, `${headerTag}\n${entryLine}`);
-    } else {
-      existing = `${existing.trim()}\n\n${headerTag}\n${entryLine}\n`;
-    }
+    const updated = appendQuoteUnderDate(
+      existing,
+      headerTag,
+      dateLabel,
+      entryLine
+    );
 
-    fs.writeFileSync(LOVE_QUOTES_PATH, existing, 'utf8');
-    res.status(200).json({ ok: true, content: existing.trim() });
+    fs.writeFileSync(LOVE_QUOTES_PATH, updated, 'utf8');
+    res.status(200).json({ ok: true, content: updated.trim() });
   } catch (err) {
     res.status(500).json({ error: `写入心动语录失败: ${err.message}` });
   }
@@ -547,6 +667,7 @@ app.post('/api/chat', async (req, res) => {
   try {
     let lastError = null;
     let sentAnyText = false;
+    let stationRawOutput = '';
 
     for (let i = 0; i < PROXY_STATIONS.length; i += 1) {
       const station = PROXY_STATIONS[i];
@@ -596,6 +717,7 @@ app.post('/api/chat', async (req, res) => {
         let stationSentText = false;
         let announcedChannel = false;
         let rawSampleLogged = false;
+        stationRawOutput = '';
 
         const processLine = (rawLine) => {
           const trimmed = rawLine.trim();
@@ -646,6 +768,7 @@ app.post('/api/chat', async (req, res) => {
             }
             stationSentText = true;
             sentAnyText = true;
+            stationRawOutput += text;
             res.write(`data: ${JSON.stringify({ text })}\n\n`);
           } else if (!rawSampleLogged && parsed?.type !== 'ping') {
             rawSampleLogged = true;
@@ -723,6 +846,7 @@ app.post('/api/chat', async (req, res) => {
       const officialModel = normalizeOfficialModel(rawModel);
       console.log('[anthropic-fallback] 启用官方兜底，模型:', officialModel);
       res.write(`data: ${JSON.stringify({ channel: '官方兜底' })}\n\n`);
+      stationRawOutput = '';
 
       const payload = buildCachedAnthropicPayload(
         coreProfileText,
@@ -757,6 +881,7 @@ app.post('/api/chat', async (req, res) => {
           event.delta.type === 'text_delta'
         ) {
           sentAnyText = true;
+          stationRawOutput += event.delta.text;
           res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
         }
       }
@@ -765,6 +890,15 @@ app.post('/api/chat', async (req, res) => {
 
     if (lastError && !sentAnyText) {
       throw lastError;
+    }
+
+    const claudeQuoteAdd = extractClaudeQuoteAdd(stationRawOutput);
+    if (claudeQuoteAdd) {
+      try {
+        runClaudeQuoteAdd(claudeQuoteAdd);
+      } catch (qErr) {
+        console.error('[love-quotes] 写入失败:', qErr.message);
+      }
     }
 
     if (!sentAnyText) {
