@@ -333,11 +333,336 @@ function extractClaudeQuoteActions(rawText = '') {
   return actions;
 }
 
-// 剥离语录控制标记，避免把指令直接吐给用户
-function stripQuoteControlTokens(rawText = '') {
+// =========================================================================
+// 2.5 记忆条系统（按需主动搜索 + 克劳德自主增删改，存为 memory-notes.json）
+// =========================================================================
+const MEMORY_NOTES_PATH = path.join(__dirname, 'memory-notes.json');
+
+function readMemoryNotes() {
+  try {
+    if (!fs.existsSync(MEMORY_NOTES_PATH)) {
+      return [];
+    }
+    const raw = fs.readFileSync(MEMORY_NOTES_PATH, 'utf8').trim();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    console.error('[memory-notes] 读取失败:', err.message);
+    return [];
+  }
+}
+
+function writeMemoryNotes(notes = []) {
+  const safeList = Array.isArray(notes) ? notes : [];
+  fs.writeFileSync(
+    MEMORY_NOTES_PATH,
+    JSON.stringify(safeList, null, 2),
+    'utf8'
+  );
+  return safeList;
+}
+
+function normalizeTags(rawTags) {
+  if (Array.isArray(rawTags)) {
+    return rawTags
+      .map((t) => String(t || '').trim())
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+  return String(rawTags || '')
+    .split(/[,，、|/|\s]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function addMemoryNote({ date, tags, content }) {
+  const cleanContent = String(content || '').trim();
+  if (!cleanContent) {
+    return { ok: false, error: '记忆条内容不能为空' };
+  }
+  const notes = readMemoryNotes();
+  const noteDate = cleanDateLabel(date || '') || getTodayMonthDay();
+  const tagList = normalizeTags(tags);
+
+  const duplicate = notes.find(
+    (n) =>
+      n.content === cleanContent ||
+      (n.content.includes(cleanContent) && cleanContent.length >= 6)
+  );
+  if (duplicate) {
+    if (tagList.length > 0) {
+      duplicate.tags = Array.from(new Set([...(duplicate.tags || []), ...tagList]));
+      duplicate.updatedAt = Date.now();
+      writeMemoryNotes(notes);
+    }
+    return { ok: true, note: duplicate, duplicated: true };
+  }
+
+  const newNote = {
+    id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    date: noteDate,
+    tags: tagList,
+    content: cleanContent,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  notes.push(newNote);
+  writeMemoryNotes(notes);
+  return { ok: true, note: newNote };
+}
+
+function editMemoryNote({ id, target, newContent, newTags, newDate }) {
+  const notes = readMemoryNotes();
+  const targetStr = String(target || '').trim();
+  let idx = -1;
+
+  if (id) {
+    idx = notes.findIndex((n) => n.id === id);
+  }
+  if (idx === -1 && targetStr) {
+    idx = notes.findIndex(
+      (n) =>
+        n.content === targetStr ||
+        n.content.includes(targetStr) ||
+        (Array.isArray(n.tags) && n.tags.some((t) => t === targetStr))
+    );
+  }
+
+  if (idx === -1) {
+    return { ok: false, error: '未匹配到对应的记忆条' };
+  }
+
+  if (typeof newContent === 'string' && newContent.trim()) {
+    notes[idx].content = newContent.trim();
+  }
+  if (newTags !== undefined) {
+    const parsedTags = normalizeTags(newTags);
+    if (parsedTags.length > 0) {
+      notes[idx].tags = parsedTags;
+    }
+  }
+  if (typeof newDate === 'string' && newDate.trim()) {
+    notes[idx].date = cleanDateLabel(newDate);
+  }
+  notes[idx].updatedAt = Date.now();
+
+  writeMemoryNotes(notes);
+  return { ok: true, note: notes[idx] };
+}
+
+function deleteMemoryNote({ id, target }) {
+  const notes = readMemoryNotes();
+  const targetStr = String(target || '').trim();
+  let idx = -1;
+
+  if (id) {
+    idx = notes.findIndex((n) => n.id === id);
+  }
+  if (idx === -1 && targetStr) {
+    idx = notes.findIndex(
+      (n) =>
+        n.content === targetStr ||
+        n.content.includes(targetStr) ||
+        (Array.isArray(n.tags) && n.tags.some((t) => t === targetStr))
+    );
+  }
+
+  if (idx === -1) {
+    return { ok: false, error: '未找到要删除的记忆条' };
+  }
+
+  const [removed] = notes.splice(idx, 1);
+  writeMemoryNotes(notes);
+  return { ok: true, removed };
+}
+
+function searchMemoryNotes(queryStr = '', limit = 6) {
+  const notes = readMemoryNotes();
+  if (notes.length === 0) return [];
+
+  const rawQuery = String(queryStr || '').trim();
+  if (!rawQuery || rawQuery === '全部' || rawQuery === 'all') {
+    return notes.slice(-limit).reverse();
+  }
+
+  const terms = rawQuery
+    .split(/[,，、|/|\s]+/)
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (terms.length === 0) {
+    return notes.slice(-limit).reverse();
+  }
+
+  const scored = notes
+    .map((note) => {
+      let score = 0;
+      const noteDate = String(note.date || '').toLowerCase();
+      const noteContent = String(note.content || '').toLowerCase();
+      const noteTags = Array.isArray(note.tags)
+        ? note.tags.map((t) => String(t).toLowerCase())
+        : [];
+
+      for (const term of terms) {
+        if (noteDate === term || noteDate.includes(term)) {
+          score += 5;
+        }
+        if (noteTags.some((t) => t === term)) {
+          score += 6;
+        } else if (noteTags.some((t) => t.includes(term) || term.includes(t))) {
+          score += 4;
+        }
+        if (noteContent.includes(term)) {
+          score += 3;
+        }
+      }
+
+      return { note, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (b.note.updatedAt || 0) - (a.note.updatedAt || 0);
+    });
+
+  return scored.slice(0, limit).map((item) => item.note);
+}
+
+// 解析克劳德回复末尾的记忆条编辑指令：[[记记忆|关键词1,关键词2: 内容]] / [[改记忆: 旧 => 新]] / [[删记忆: 目标]]
+function extractClaudeMemoryActions(rawText = '') {
+  const text = String(rawText || '');
+  const actions = [];
+
+  // 1. [[记记忆|关键词1,关键词2: 内容]] 或 [[记记忆|11.24|关键词1,关键词2: 内容]] 或 [[记记忆: 内容]]
+  const addMatches = [
+    ...text.matchAll(
+      /\[\[\s*记记忆(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*\]\]/gi
+    ),
+  ];
+  for (const m of addMatches) {
+    const meta = (m[1] || '').trim();
+    const content = (m[2] || '').trim();
+    if (!content) continue;
+
+    let date = '';
+    let tagsRaw = meta;
+    if (meta.includes('|')) {
+      const parts = meta.split('|').map((p) => p.trim());
+      if (/^\d{1,2}\.\d{1,2}$/.test(parts[0])) {
+        date = parts[0];
+        tagsRaw = parts.slice(1).join(',');
+      } else {
+        tagsRaw = parts.join(',');
+      }
+    } else if (/^\d{1,2}\.\d{1,2}$/.test(meta)) {
+      date = meta;
+      tagsRaw = '';
+    }
+
+    actions.push({
+      action: 'add',
+      date: date || getTodayMonthDay(),
+      tags: normalizeTags(tagsRaw),
+      content,
+    });
+  }
+
+  // 2. [[改记忆: 原文或关键词 => 新内容]]（新内容后可选 |关键词1,关键词2）
+  const editMatches = [
+    ...text.matchAll(
+      /\[\[\s*改记忆\s*:\s*([\s\S]*?)\s*(?:=>|->|→)\s*([\s\S]*?)\s*\]\]/gi
+    ),
+  ];
+  for (const m of editMatches) {
+    const target = (m[1] || '').trim();
+    const rightSide = (m[2] || '').trim();
+    if (!target || !rightSide) continue;
+
+    let newContent = rightSide;
+    let newTags;
+    const pipeIdx = rightSide.lastIndexOf('|');
+    if (pipeIdx > 0) {
+      newContent = rightSide.slice(0, pipeIdx).trim();
+      newTags = normalizeTags(rightSide.slice(pipeIdx + 1));
+    }
+
+    actions.push({
+      action: 'edit',
+      target,
+      newContent,
+      newTags,
+    });
+  }
+
+  // 3. [[删记忆: 原文或关键词]]
+  const deleteMatches = [
+    ...text.matchAll(/\[\[\s*删记忆\s*:\s*([\s\S]*?)\s*\]\]/gi),
+  ];
+  for (const m of deleteMatches) {
+    const target = (m[1] || '').trim();
+    if (target) {
+      actions.push({
+        action: 'delete',
+        target,
+      });
+    }
+  }
+
+  return actions;
+}
+
+function runClaudeMemoryActions(actions = []) {
+  if (!Array.isArray(actions) || actions.length === 0) return [];
+  const logs = [];
+
+  for (const item of actions) {
+    if (item.action === 'add') {
+      const res = addMemoryNote({
+        date: item.date,
+        tags: item.tags,
+        content: item.content,
+      });
+      if (res.ok) {
+        logs.push(
+          `新增(${res.note.date}) [${(res.note.tags || []).join(',')}]: ${res.note.content}`
+        );
+      }
+    } else if (item.action === 'edit') {
+      const res = editMemoryNote({
+        target: item.target,
+        newContent: item.newContent,
+        newTags: item.newTags,
+      });
+      if (res.ok) {
+        logs.push(`修改: "${item.target}" => "${res.note.content}"`);
+      } else {
+        console.warn(`[memory-notes] 修改跳过: ${res.error}`);
+      }
+    } else if (item.action === 'delete') {
+      const res = deleteMemoryNote({ target: item.target });
+      if (res.ok) {
+        logs.push(`删除: "${res.removed.content}"`);
+      } else {
+        console.warn(`[memory-notes] 删除跳过: ${res.error}`);
+      }
+    }
+  }
+
+  if (logs.length > 0) {
+    console.log('[memory-notes] 克劳德已更新记忆条:', logs.join(' | '));
+  }
+  return logs;
+}
+
+// 剥离语录与记忆条控制标记，避免把指令直接吐给用户
+function stripControlTokens(rawText = '') {
   return String(rawText || '')
     .replace(/\[\[\s*(?:记|改|删|重写)顾青语录(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi, '')
     .replace(/\[\[\s*(?:记|改|删|重写)顾青语录(?:\|[^\]]*)?$/gi, '')
+    .replace(/\[\[\s*(?:记|改|删)记忆(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi, '')
+    .replace(/\[\[\s*(?:记|改|删)记忆(?:\|[^\]]*)?$/gi, '')
     .trim();
 }
 
@@ -411,6 +736,17 @@ const CLAUDE_QUOTE_SYSTEM_RULE = [
   '- 只在确实需要时使用，不要在正常说话里念出方括号指令。',
 ].join('\n');
 
+const CLAUDE_MEMORY_NOTE_RULE = [
+  '【按需记忆条（主动搜索与自主编辑权限）】',
+  '- 你有一个独立的长期记忆条仓库，平时不会自动塞进对话以节省开销；只有当你自己觉得需要回忆过往某件事、约定、喜好或细节时，再主动输出检索指令：',
+  '  · 主动搜索记忆：[[搜记忆: 关键词1,关键词2]]（例如 [[搜记忆: 忌口,香菜]] 或 [[搜记忆: 11.20]]）',
+  '- 当对话里出现值得以后按关键词捞出来的关键事实、约定、偏好变化时，你可以在回复末尾自己新增、修改或删除记忆条：',
+  '  · 新增记忆条：[[记记忆|关键词1,关键词2: 一句话事实或约定]]（可选日期 [[记记忆|11.24|关键词1,关键词2: 内容]]）',
+  '  · 修改记忆条：[[改记忆: 原文或关键词 => 新内容|新关键词1,新关键词2]]（新关键词可选）',
+  '  · 删除记忆条：[[删记忆: 原文或关键词]]',
+  '- 保持精炼，不要把普通寒暄写进记忆条，也不要在正常对话中念出方括号指令。',
+].join('\n');
+
 // 3. 读取清理后的历史聊天记录作为常驻记忆
 const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
 let cleanedChatHistory = '';
@@ -427,7 +763,6 @@ try {
   console.error('[memory] 读取 cleaned_chat_history.txt 失败:', err.message);
 }
 
-// 规范化文本便于精确匹配被删除的历史片段
 function normalizeForMatch(str = '') {
   return String(str || '')
     .replace(/\r\n/g, '\n')
@@ -435,7 +770,6 @@ function normalizeForMatch(str = '') {
     .trim();
 }
 
-// 从常驻历史聊天记录中剔除用户已删除的消息片段
 function filterDeletedHistory(rawHistory, deletedMemories = []) {
   if (!rawHistory) return '';
   if (!Array.isArray(deletedMemories) || deletedMemories.length === 0) {
@@ -513,18 +847,18 @@ function buildMemoryPrefix(deletedMemories = []) {
   );
 
   if (!effectiveHistory) {
-    return `${relationshipTone}\n\n${CLAUDE_QUOTE_SYSTEM_RULE}`;
+    return `${relationshipTone}\n\n${CLAUDE_QUOTE_SYSTEM_RULE}\n\n${CLAUDE_MEMORY_NOTE_RULE}`;
   }
 
   return [
     relationshipTone,
     CLAUDE_QUOTE_SYSTEM_RULE,
+    CLAUDE_MEMORY_NOTE_RULE,
     '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
     effectiveHistory,
   ].join('\n\n');
 }
 
-// 统一转成 Anthropic 原生 /v1/messages 地址，确保透传 cache_control 命中缓存
 function normalizeAnthropicMessagesUrl(rawUrl, fallbackUrl) {
   const base = (rawUrl || fallbackUrl || '').trim().replace(/\/+$/, '');
   if (!base) return '';
@@ -536,14 +870,12 @@ function normalizeAnthropicMessagesUrl(rawUrl, fallbackUrl) {
   return `${base}/v1/messages`;
 }
 
-// 去掉类似 "[Kiro-企业正价]" 的中转前缀
 function stripChannelPrefix(modelName = '') {
   return String(modelName || '')
     .replace(/^\[[^\]]+\]\s*/g, '')
     .trim();
 }
 
-// opai / 奇异果 / 幕间 使用标准或中转模型名（默认 claude-fable-5-1）
 function resolveStandardProxyModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
   if (!cleaned) return 'claude-fable-5-1';
@@ -551,7 +883,6 @@ function resolveStandardProxyModel(rawModel = '') {
   return cleaned;
 }
 
-// 切到小忆时，自动映射为小忆支持的 [Kiro-企业正价] 模型
 function resolveXiaoyiModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
   if (!cleaned) return '[Kiro-企业正价]claude-fable-5-1';
@@ -566,7 +897,6 @@ function resolveXiaoyiModel(rawModel = '') {
   return `[Kiro-企业正价]${cleaned}`;
 }
 
-// 官方 Anthropic 兜底（将 fable 或非标准 5.5 写法归回可用模型，避免 404）
 function normalizeOfficialModel(rawModel = '') {
   const cleaned = stripChannelPrefix(rawModel);
   const fallbackDefault =
@@ -586,7 +916,6 @@ function normalizeOfficialModel(rawModel = '') {
   return fallbackDefault;
 }
 
-// 兼容提取 Anthropic 原生流 / 非流 / OpenAI 兼容流里的文本增量
 function extractAnthropicOrProxyText(parsed) {
   if (!parsed || typeof parsed !== 'object') return '';
 
@@ -794,6 +1123,7 @@ function isFailoverError(err) {
 
 app.get('/health', (req, res) => {
   const quotesText = readLoveQuotesText();
+  const notes = readMemoryNotes();
   res.status(200).json({
     ok: true,
     status: 'running',
@@ -805,6 +1135,7 @@ app.get('/health', (req, res) => {
     loveQuotesChars: quotesText.length,
     hasHistoryMemory: Boolean(cleanedChatHistory),
     historyChars: cleanedChatHistory.length,
+    memoryNotesCount: notes.length,
   });
 });
 
@@ -877,6 +1208,81 @@ app.post('/api/love-quotes', (req, res) => {
     res.status(200).json({ ok: true, action, content: updated.trim() });
   } catch (err) {
     res.status(500).json({ error: `操作心动语录失败: ${err.message}` });
+  }
+});
+
+// 记忆条读取/搜索接口
+app.get('/api/memory-notes', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const notes = readMemoryNotes();
+  if (!q) {
+    return res.status(200).json({ ok: true, total: notes.length, notes });
+  }
+  const matched = searchMemoryNotes(q, 8);
+  return res.status(200).json({
+    ok: true,
+    query: q,
+    total: notes.length,
+    notes: matched,
+  });
+});
+
+// 记忆条增删改接口（前端弹窗管理 + 克劳德主动搜索/编辑共用）
+app.post('/api/memory-notes', (req, res) => {
+  const {
+    action = 'add',
+    id,
+    date,
+    tags,
+    content,
+    target,
+    newContent,
+    newTags,
+    newDate,
+    query,
+  } = req.body || {};
+
+  try {
+    if (action === 'search') {
+      const matched = searchMemoryNotes(query || '', 6);
+      return res.status(200).json({ ok: true, notes: matched });
+    }
+
+    if (action === 'edit') {
+      const result = editMemoryNote({
+        id,
+        target: target || content,
+        newContent: newContent || content,
+        newTags,
+        newDate,
+      });
+      if (!result.ok) {
+        return res.status(400).json({ error: result.error });
+      }
+      return res
+        .status(200)
+        .json({ ok: true, note: result.note, notes: readMemoryNotes() });
+    }
+
+    if (action === 'delete') {
+      const result = deleteMemoryNote({ id, target: target || content });
+      if (!result.ok) {
+        return res.status(400).json({ error: result.error });
+      }
+      return res
+        .status(200)
+        .json({ ok: true, removed: result.removed, notes: readMemoryNotes() });
+    }
+
+    const result = addMemoryNote({ date, tags, content });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res
+      .status(200)
+      .json({ ok: true, note: result.note, notes: readMemoryNotes() });
+  } catch (err) {
+    return res.status(500).json({ error: `操作记忆条失败: ${err.message}` });
   }
 });
 
@@ -1020,7 +1426,7 @@ app.post('/api/chat', async (req, res) => {
             stationSentText = true;
             sentAnyText = true;
             stationRawOutput += text;
-            const visibleText = stripQuoteControlTokens(text);
+            const visibleText = stripControlTokens(text);
             if (visibleText) {
               res.write(`data: ${JSON.stringify({ text: visibleText })}\n\n`);
             }
@@ -1136,7 +1542,7 @@ app.post('/api/chat', async (req, res) => {
         ) {
           sentAnyText = true;
           stationRawOutput += event.delta.text;
-          const visibleText = stripQuoteControlTokens(event.delta.text);
+          const visibleText = stripControlTokens(event.delta.text);
           if (visibleText) {
             res.write(`data: ${JSON.stringify({ text: visibleText })}\n\n`);
           }
@@ -1155,6 +1561,15 @@ app.post('/api/chat', async (req, res) => {
         runClaudeQuoteActions(claudeQuoteActions);
       } catch (qErr) {
         console.error('[love-quotes] 更新失败:', qErr.message);
+      }
+    }
+
+    const claudeMemoryActions = extractClaudeMemoryActions(stationRawOutput);
+    if (claudeMemoryActions.length > 0) {
+      try {
+        runClaudeMemoryActions(claudeMemoryActions);
+      } catch (mErr) {
+        console.error('[memory-notes] 更新失败:', mErr.message);
       }
     }
 
