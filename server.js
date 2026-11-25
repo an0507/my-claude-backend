@@ -46,6 +46,65 @@ function ensureLoveQuotesFile() {
   return initial;
 }
 
+// 自动将 love-quotes.txt 同步提交到 GitHub 仓库（需在 Render 配置 GITHUB_TOKEN 与 GITHUB_REPO）
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
+const GITHUB_REPO = (process.env.GITHUB_REPO || '').trim();
+const GITHUB_BRANCH = (process.env.GITHUB_BRANCH || 'main').trim();
+const GITHUB_QUOTES_FILE = 'love-quotes.txt';
+
+async function syncLoveQuotesToGitHub(
+  contentText,
+  commitMessage = 'chore: update love-quotes.txt'
+) {
+  if (!GITHUB_TOKEN || !GITHUB_REPO) {
+    console.warn(
+      '[github-sync] 未配置 GITHUB_TOKEN 或 GITHUB_REPO，仅写入本地临时文件'
+    );
+    return { synced: false };
+  }
+
+  const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(
+    GITHUB_QUOTES_FILE
+  )}`;
+  const headers = {
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'my-claude-backend',
+  };
+
+  let currentSha = '';
+  const getResp = await fetch(
+    `${apiUrl}?ref=${encodeURIComponent(GITHUB_BRANCH)}`,
+    { headers }
+  );
+  if (getResp.ok) {
+    const fileData = await getResp.json();
+    currentSha = fileData.sha || '';
+  }
+
+  const putResp = await fetch(apiUrl, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({
+      message: commitMessage,
+      content: Buffer.from(String(contentText || ''), 'utf8').toString(
+        'base64'
+      ),
+      branch: GITHUB_BRANCH,
+      ...(currentSha ? { sha: currentSha } : {}),
+    }),
+  });
+
+  if (!putResp.ok) {
+    const errBody = await putResp.text();
+    throw new Error(`GitHub 同步失败 ${putResp.status}: ${errBody}`);
+  }
+
+  console.log(`[github-sync] 已自动同步 ${GITHUB_QUOTES_FILE} 到 ${GITHUB_REPO}`);
+  return { synced: true };
+}
+
 function getTodayMonthDay() {
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
@@ -134,7 +193,9 @@ function appendQuoteUnderDate(existingText, headerTag, dateLabel, entryLine) {
     return `${normalized.trim()}\n\n${headerTag}\n${dateLabel}\n${entryLine}\n`;
   }
 
-  const lines = normalized.slice(bounds.afterHeaderIdx, bounds.sectionEnd).split('\n');
+  const lines = normalized
+    .slice(bounds.afterHeaderIdx, bounds.sectionEnd)
+    .split('\n');
   const dateHeaderIdx = lines.findIndex(
     (line) => cleanDateLabel(line) === dateLabel
   );
@@ -148,7 +209,10 @@ function appendQuoteUnderDate(existingText, headerTag, dateLabel, entryLine) {
       }
       insertIdx += 1;
     }
-    while (insertIdx > dateHeaderIdx + 1 && lines[insertIdx - 1].trim() === '') {
+    while (
+      insertIdx > dateHeaderIdx + 1 &&
+      lines[insertIdx - 1].trim() === ''
+    ) {
       insertIdx -= 1;
     }
     lines.splice(insertIdx, 0, entryLine);
@@ -319,9 +383,7 @@ function extractClaudeQuoteActions(rawText = '') {
   }
 
   const replaceMatches = [
-    ...text.matchAll(
-      /\[\[\s*重写顾青语录\s*:\s*([\s\S]*?)\s*\]\]/gi
-    ),
+    ...text.matchAll(/\[\[\s*重写顾青语录\s*:\s*([\s\S]*?)\s*\]\]/gi),
   ];
   for (const m of replaceMatches) {
     actions.push({
@@ -393,7 +455,9 @@ function addMemoryNote({ date, tags, content }) {
   );
   if (duplicate) {
     if (tagList.length > 0) {
-      duplicate.tags = Array.from(new Set([...(duplicate.tags || []), ...tagList]));
+      duplicate.tags = Array.from(
+        new Set([...(duplicate.tags || []), ...tagList])
+      );
       duplicate.updatedAt = Date.now();
       writeMemoryNotes(notes);
     }
@@ -530,12 +594,11 @@ function searchMemoryNotes(queryStr = '', limit = 6) {
   return scored.slice(0, limit).map((item) => item.note);
 }
 
-// 解析克劳德回复末尾的记忆条编辑指令：[[记记忆|关键词1,关键词2: 内容]] / [[改记忆: 旧 => 新]] / [[删记忆: 目标]]
+// 解析克劳德回复末尾的记忆条编辑指令
 function extractClaudeMemoryActions(rawText = '') {
   const text = String(rawText || '');
   const actions = [];
 
-  // 1. [[记记忆|关键词1,关键词2: 内容]] 或 [[记记忆|11.24|关键词1,关键词2: 内容]] 或 [[记记忆: 内容]]
   const addMatches = [
     ...text.matchAll(
       /\[\[\s*记记忆(?:\|([^:\]]+))?\s*:\s*([\s\S]*?)\s*\]\]/gi
@@ -569,7 +632,6 @@ function extractClaudeMemoryActions(rawText = '') {
     });
   }
 
-  // 2. [[改记忆: 原文或关键词 => 新内容]]（新内容后可选 |关键词1,关键词2）
   const editMatches = [
     ...text.matchAll(
       /\[\[\s*改记忆\s*:\s*([\s\S]*?)\s*(?:=>|->|→)\s*([\s\S]*?)\s*\]\]/gi
@@ -596,7 +658,6 @@ function extractClaudeMemoryActions(rawText = '') {
     });
   }
 
-  // 3. [[删记忆: 原文或关键词]]
   const deleteMatches = [
     ...text.matchAll(/\[\[\s*删记忆\s*:\s*([\s\S]*?)\s*\]\]/gi),
   ];
@@ -626,7 +687,9 @@ function runClaudeMemoryActions(actions = []) {
       });
       if (res.ok) {
         logs.push(
-          `新增(${res.note.date}) [${(res.note.tags || []).join(',')}]: ${res.note.content}`
+          `新增(${res.note.date}) [${(res.note.tags || []).join(',')}]: ${
+            res.note.content
+          }`
         );
       }
     } else if (item.action === 'edit') {
@@ -659,7 +722,10 @@ function runClaudeMemoryActions(actions = []) {
 // 剥离语录与记忆条控制标记，避免把指令直接吐给用户
 function stripControlTokens(rawText = '') {
   return String(rawText || '')
-    .replace(/\[\[\s*(?:记|改|删|重写)顾青语录(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi, '')
+    .replace(
+      /\[\[\s*(?:记|改|删|重写)顾青语录(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi,
+      ''
+    )
     .replace(/\[\[\s*(?:记|改|删|重写)顾青语录(?:\|[^\]]*)?$/gi, '')
     .replace(/\[\[\s*(?:记|改|删)记忆(?:\|[^:\]]+)?\s*:[\s\S]*?\]\]/gi, '')
     .replace(/\[\[\s*(?:记|改|删)记忆(?:\|[^\]]*)?$/gi, '')
@@ -1143,7 +1209,7 @@ app.get('/api/love-quotes', (req, res) => {
   res.status(200).json({ ok: true, content: readLoveQuotesText() });
 });
 
-app.post('/api/love-quotes', (req, res) => {
+app.post('/api/love-quotes', async (req, res) => {
   const {
     action = 'append',
     section,
@@ -1205,7 +1271,24 @@ app.post('/api/love-quotes', (req, res) => {
     }
 
     fs.writeFileSync(LOVE_QUOTES_PATH, updated, 'utf8');
-    res.status(200).json({ ok: true, action, content: updated.trim() });
+
+    let githubSynced = false;
+    try {
+      const syncRes = await syncLoveQuotesToGitHub(
+        updated,
+        `chore: ${action} love quotes`
+      );
+      githubSynced = Boolean(syncRes?.synced);
+    } catch (ghErr) {
+      console.error('[github-sync] 同步报错:', ghErr.message);
+    }
+
+    res.status(200).json({
+      ok: true,
+      action,
+      githubSynced,
+      content: updated.trim(),
+    });
   } catch (err) {
     res.status(500).json({ error: `操作心动语录失败: ${err.message}` });
   }
@@ -1390,7 +1473,12 @@ app.post('/api/chat', async (req, res) => {
             : trimmed;
           if (!payload || payload === '[DONE]') return;
 
-          const parsed = JSON.parse(payload);
+          let parsed;
+          try {
+            parsed = JSON.parse(payload);
+          } catch {
+            return;
+          }
 
           const usage = parsed?.message?.usage || parsed?.usage;
           if (usage) {
@@ -1448,24 +1536,12 @@ app.post('/api/chat', async (req, res) => {
           buffer = lines.pop() || '';
 
           for (const line of lines) {
-            try {
-              processLine(line);
-            } catch (parseOrStreamErr) {
-              if (parseOrStreamErr?.isFailover) {
-                throw parseOrStreamErr;
-              }
-            }
+            processLine(line);
           }
         }
 
         if (buffer.trim()) {
-          try {
-            processLine(buffer);
-          } catch (parseOrStreamErr) {
-            if (parseOrStreamErr?.isFailover) {
-              throw parseOrStreamErr;
-            }
-          }
+          processLine(buffer);
         }
 
         const hasMoreStation =
