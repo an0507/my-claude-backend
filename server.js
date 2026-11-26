@@ -1143,13 +1143,10 @@ console.log(
   anthropic ? '已启用(claude-opus-4-6)' : '未配置'
 );
 
-// 按变动频率从低到高排布：
-// 1. 核心档案（几乎不变）
-// 2. 关系基调 + 语录/记忆条规则（极少变）
-// 3. 已清理聊天记录（每天只变一次）
-// 4. 心动语录（按需增删改）
-// 在稳定长前缀末尾放 1 个缓存断点，尽量让前面整段在改动前命中缓存；
-// 动态变化的 systemPrompt 放在最后，不打断前面缓存。
+// 三层缓存断点（共 3 个，不超过 Anthropic 4 个上限）：
+// 断点 1：历史聊天记录末尾（每天只变一次，锁死核心档案 + 规则 + 历史聊天记录）
+// 断点 2：心动语录末尾（锁住心动语录）
+// 断点 3：messages 倒数第 2 条（锁住今天已发生的多轮对话，新发消息只需写最后 1 条）
 function buildCachedAnthropicPayload(
   coreProfile,
   relationshipTone,
@@ -1188,21 +1185,21 @@ function buildCachedAnthropicPayload(
     systemBlocks.push({
       type: 'text',
       text: historyBlock,
+      cache_control: { type: 'ephemeral' },
     });
+  } else if (systemBlocks.length > 0) {
+    systemBlocks[systemBlocks.length - 1] = {
+      ...systemBlocks[systemBlocks.length - 1],
+      cache_control: { type: 'ephemeral' },
+    };
   }
 
   if (loveQuotes) {
     systemBlocks.push({
       type: 'text',
       text: `【心动语录】\n${loveQuotes}`,
-    });
-  }
-
-  if (systemBlocks.length > 0) {
-    systemBlocks[systemBlocks.length - 1] = {
-      ...systemBlocks[systemBlocks.length - 1],
       cache_control: { type: 'ephemeral' },
-    };
+    });
   }
 
   if (systemPrompt) {
@@ -1212,9 +1209,35 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  const formattedMessages = messages
-    .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
-    .map((msg) => msg);
+  const cleanMessages = messages.filter(
+    (m) => m && (m.role === 'user' || m.role === 'assistant')
+  );
+
+  const formattedMessages = cleanMessages.map((msg, idx) => {
+    if (cleanMessages.length >= 3 && idx === cleanMessages.length - 2) {
+      if (typeof msg.content === 'string') {
+        return {
+          role: msg.role,
+          content: [
+            {
+              type: 'text',
+              text: msg.content,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        };
+      }
+      if (Array.isArray(msg.content) && msg.content.length > 0) {
+        const cloned = [...msg.content];
+        cloned[cloned.length - 1] = {
+          ...cloned[cloned.length - 1],
+          cache_control: { type: 'ephemeral' },
+        };
+        return { role: msg.role, content: cloned };
+      }
+    }
+    return msg;
+  });
 
   return {
     model,
