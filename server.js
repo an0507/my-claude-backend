@@ -8,6 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
+// 常驻历史聊天记录截断上限（字符数），控制在缓存安全线内以减少重复写入开销
+const MAX_INLINE_HISTORY_CHARS = 8000;
+
 // 1. 读取固定核心档案（core-profile.txt），放入 system 最前面（变动最少）
 const CORE_PROFILE_PATH = path.join(__dirname, 'core-profile.txt');
 let coreProfileText = '';
@@ -844,9 +847,10 @@ const CLAUDE_QUOTE_SYSTEM_RULE = [
 ].join('\n');
 
 const CLAUDE_MEMORY_NOTE_RULE = [
-  '【按需记忆条（主动搜索与自主编辑权限）】',
-  '- 你有一个独立的长期记忆条仓库，平时不会自动塞进对话以节省开销；只有当你自己觉得需要回忆过往某件事、约定、喜好或细节时，再主动输出检索指令：',
-  '  · 主动搜索记忆：[[搜记忆: 关键词1,关键词2]]（例如 [[搜记忆: 忌口,香菜]] 或 [[搜记忆: 11.20]]）',
+  '【按需记忆条与过往历史检索（主动搜索与自主编辑权限）】',
+  '- 你有一个独立的长期记忆条仓库，以及一份完整的早期聊天记录文件（cleaned_chat_history.txt）。为节省开销并保持缓存命中，早期聊天记录默认只带最近一小段，更早的记录不会每轮全量塞入；当你觉得需要回忆过往某件事、约定、喜好、日期或细节时，请主动输出检索指令：',
+  '  · 主动搜索记忆条：[[搜记忆: 关键词1,关键词2]]（例如 [[搜记忆: 忌口,香菜]] 或 [[搜记忆: 11.20]]）',
+  '  · 主动搜索早期聊天记录：[[搜历史: 关键词或日期]]（例如 [[搜历史: 11.15]] 或 [[搜历史: 咖啡]]）',
   '- 当对话里出现值得以后按关键词捞出来的关键事实、约定、偏好变化时，你可以在回复末尾自己新增、修改或删除记忆条：',
   '  · 新增记忆条：[[记记忆|关键词1,关键词2: 一句话事实或约定]]（可选日期 [[记记忆|11.24|关键词1,关键词2: 内容]]）',
   '  · 修改记忆条：[[改记忆: 原文或关键词 => 新内容|新关键词1,新关键词2]]（新关键词可选）',
@@ -854,20 +858,113 @@ const CLAUDE_MEMORY_NOTE_RULE = [
   '- 保持精炼，不要把普通寒暄写进记忆条，也不要在正常对话中念出方括号指令。',
 ].join('\n');
 
-// 3. 读取清理后的历史聊天记录作为常驻记忆（每天只变一次）
+// 3. 读取清理后的完整历史聊天记录（用于按需检索），常驻仅取最近一小段控制 token 体积
 const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
-let cleanedChatHistory = '';
+let fullCleanedChatHistory = '';
+let recentInlineHistory = '';
+
+function buildRecentTailHistory(rawText = '', maxChars = MAX_INLINE_HISTORY_CHARS) {
+  const clean = String(rawText || '').trim();
+  if (!clean) return '';
+  if (clean.length <= maxChars) return clean;
+  const sliced = clean.slice(-maxChars);
+  const firstNewline = sliced.indexOf('\n');
+  return firstNewline > 0 && firstNewline < 200
+    ? sliced.slice(firstNewline + 1).trim()
+    : sliced.trim();
+}
+
 try {
   if (fs.existsSync(HISTORY_FILE_PATH)) {
-    cleanedChatHistory = fs.readFileSync(HISTORY_FILE_PATH, 'utf8').trim();
+    fullCleanedChatHistory = fs.readFileSync(HISTORY_FILE_PATH, 'utf8').trim();
+    recentInlineHistory = buildRecentTailHistory(
+      fullCleanedChatHistory,
+      MAX_INLINE_HISTORY_CHARS
+    );
     console.log(
-      `[memory] 已加载 cleaned_chat_history.txt，长度: ${cleanedChatHistory.length} 字符`
+      `[memory] 已加载 cleaned_chat_history.txt，全文 ${fullCleanedChatHistory.length} 字符，常驻最近 ${recentInlineHistory.length} 字符`
     );
   } else {
     console.log('[memory] 未找到 cleaned_chat_history.txt，跳过历史记忆注入');
   }
 } catch (err) {
   console.error('[memory] 读取 cleaned_chat_history.txt 失败:', err.message);
+}
+
+// 按关键词或日期从完整历史聊天记录中检索片段
+function searchFullChatHistory(queryStr = '', maxSnippets = 5) {
+  if (!fullCleanedChatHistory) {
+    return '【历史聊天记录检索结果】当前没有加载早期聊天记录文件。';
+  }
+
+  const rawQuery = String(queryStr || '').trim();
+  const blocks = fullCleanedChatHistory
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+
+  if (blocks.length === 0) {
+    return '【历史聊天记录检索结果】历史聊天记录为空。';
+  }
+
+  if (
+    !rawQuery ||
+    rawQuery === '最新' ||
+    rawQuery === '最近' ||
+    rawQuery === 'all' ||
+    rawQuery === '全部'
+  ) {
+    const tail = blocks.slice(-maxSnippets);
+    return `【历史聊天记录检索结果（最近 ${tail.length} 段）】\n\n${tail.join(
+      '\n\n'
+    )}`;
+  }
+
+  const terms = rawQuery
+    .split(/[,，、|/|\s]+/)
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (terms.length === 0) {
+    const tail = blocks.slice(-maxSnippets);
+    return `【历史聊天记录检索结果（最近 ${tail.length} 段）】\n\n${tail.join(
+      '\n\n'
+    )}`;
+  }
+
+  const scored = blocks
+    .map((block, idx) => {
+      const lower = block.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (lower.includes(term)) {
+          score += /^\d{1,2}\.\d{1,2}$/.test(term) ? 6 : 3;
+        }
+      }
+      return { block, idx, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return b.idx - a.idx;
+    });
+
+  if (scored.length === 0) {
+    return `【历史聊天记录检索结果（查询：${rawQuery}）】未找到包含该关键词或日期的历史片段。`;
+  }
+
+  const picked = scored.slice(0, maxSnippets).sort((a, b) => a.idx - b.idx);
+  const body = picked
+    .map((item) => {
+      const trimmedBlock =
+        item.block.length > 1400
+          ? `${item.block.slice(0, 1400)}\n...(该段较长已截断)`
+          : item.block;
+      return `--- 片段 #${item.idx + 1} ---\n${trimmedBlock}`;
+    })
+    .join('\n\n');
+
+  return `【历史聊天记录检索结果（查询：${rawQuery}，命中 ${scored.length} 段，展示前 ${picked.length} 段）】\n\n${body}`;
 }
 
 function normalizeForMatch(str = '') {
@@ -951,12 +1048,12 @@ function buildRelationshipToneBlock() {
 
 function buildEffectiveHistoryBlock(deletedMemories = []) {
   const effectiveHistory = filterDeletedHistory(
-    cleanedChatHistory,
+    recentInlineHistory,
     deletedMemories
   );
   if (!effectiveHistory) return '';
   return [
-    '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
+    '以下是近期衔接的历史聊天记录片段（更早记录可通过 [[搜历史: 关键词或日期]] 调取）：',
     effectiveHistory,
   ].join('\n\n');
 }
@@ -1143,10 +1240,7 @@ console.log(
   anthropic ? '已启用(claude-opus-4-6)' : '未配置'
 );
 
-// 三层缓存断点（共 3 个，不超过 Anthropic 4 个上限）：
-// 断点 1：历史聊天记录末尾（每天只变一次，锁死核心档案 + 规则 + 历史聊天记录）
-// 断点 2：心动语录末尾（锁住心动语录）
-// 断点 3：messages 倒数第 2 条（锁住今天已发生的多轮对话，新发消息只需写最后 1 条）
+// 缓存断点排布：精简后的稳定前缀控制在缓存安全线内，尽量整段命中 cache_read
 function buildCachedAnthropicPayload(
   coreProfile,
   relationshipTone,
@@ -1185,21 +1279,21 @@ function buildCachedAnthropicPayload(
     systemBlocks.push({
       type: 'text',
       text: historyBlock,
-      cache_control: { type: 'ephemeral' },
     });
-  } else if (systemBlocks.length > 0) {
-    systemBlocks[systemBlocks.length - 1] = {
-      ...systemBlocks[systemBlocks.length - 1],
-      cache_control: { type: 'ephemeral' },
-    };
   }
 
   if (loveQuotes) {
     systemBlocks.push({
       type: 'text',
       text: `【心动语录】\n${loveQuotes}`,
-      cache_control: { type: 'ephemeral' },
     });
+  }
+
+  if (systemBlocks.length > 0) {
+    systemBlocks[systemBlocks.length - 1] = {
+      ...systemBlocks[systemBlocks.length - 1],
+      cache_control: { type: 'ephemeral' },
+    };
   }
 
   if (systemPrompt) {
@@ -1286,10 +1380,18 @@ app.get('/health', (req, res) => {
     coreProfileChars: coreProfileText.length,
     hasLoveQuotes: Boolean(quotesText),
     loveQuotesChars: quotesText.length,
-    hasHistoryMemory: Boolean(cleanedChatHistory),
-    historyChars: cleanedChatHistory.length,
+    hasHistoryMemory: Boolean(fullCleanedChatHistory),
+    fullHistoryChars: fullCleanedChatHistory.length,
+    inlineHistoryChars: recentInlineHistory.length,
     memoryNotesCount: notes.length,
   });
+});
+
+// 按需检索完整历史聊天记录接口
+app.get('/api/history-search', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const resultText = searchFullChatHistory(q, 5);
+  return res.status(200).json({ ok: true, query: q, result: resultText });
 });
 
 app.get('/api/love-quotes', (req, res) => {
