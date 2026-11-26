@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
 // 常驻历史聊天记录截断上限（字符数），控制在缓存安全线内以减少重复写入开销
-const MAX_INLINE_HISTORY_CHARS = 8000;
+const MAX_INLINE_HISTORY_CHARS = 2000;
 
 // 1. 读取固定核心档案（core-profile.txt），放入 system 最前面（变动最少）
 const CORE_PROFILE_PATH = path.join(__dirname, 'core-profile.txt');
@@ -1646,6 +1646,14 @@ app.post('/api/chat', async (req, res) => {
           messages,
           targetProxyModel,
           resolvedMaxTokens
+        );
+
+        console.log(
+          '[payload-size]',
+          'systemChars=',
+          JSON.stringify(anthropicPayload.system || '').length,
+          'messagesChars=',
+          JSON.stringify(anthropicPayload.messages || '').length
         );
 
         const resp = await fetch(station.url, {
