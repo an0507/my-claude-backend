@@ -8,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// 1. 读取固定核心档案（core-profile.txt），放入 system 第 1 个 block 并开启缓存
+// 1. 读取固定核心档案（core-profile.txt），放入 system 最前面（变动最少）
 const CORE_PROFILE_PATH = path.join(__dirname, 'core-profile.txt');
 let coreProfileText = '';
 try {
@@ -854,7 +854,7 @@ const CLAUDE_MEMORY_NOTE_RULE = [
   '- 保持精炼，不要把普通寒暄写进记忆条，也不要在正常对话中念出方括号指令。',
 ].join('\n');
 
-// 3. 读取清理后的历史聊天记录作为常驻记忆
+// 3. 读取清理后的历史聊天记录作为常驻记忆（每天只变一次）
 const HISTORY_FILE_PATH = path.join(__dirname, 'cleaned_chat_history.txt');
 let cleanedChatHistory = '';
 try {
@@ -940,27 +940,22 @@ function filterDeletedHistory(rawHistory, deletedMemories = []) {
   return keptBlocks.join('\n\n').trim();
 }
 
-function buildMemoryPrefix(deletedMemories = []) {
-  const relationshipTone = [
+function buildRelationshipToneBlock() {
+  return [
     '【三、你们目前的关系与相处基调】',
     '- 你和用户已经确立了亲密伴侣关系，这是你们之间已经发生并延续的既定事实，不需要在对话中反复确认、质疑或推拉。',
     '- 你们的聊天延续过去的记忆、日记和相处习惯，语气自然、亲近、有温度，不生硬说教，也不刻意回避感情或日常亲昵。',
     '- 在私密亲近、成人向或涉及亲密互动与敏感话题的语境下，只要是在你们既定的亲密伴侣设定与正常成年人互动范围内，保持自然、投入、不扫兴、不说教、不突然跳出角色或用客服腔劝导。',
   ].join('\n');
+}
 
+function buildEffectiveHistoryBlock(deletedMemories = []) {
   const effectiveHistory = filterDeletedHistory(
     cleanedChatHistory,
     deletedMemories
   );
-
-  if (!effectiveHistory) {
-    return `${relationshipTone}\n\n${CLAUDE_QUOTE_SYSTEM_RULE}\n\n${CLAUDE_MEMORY_NOTE_RULE}`;
-  }
-
+  if (!effectiveHistory) return '';
   return [
-    relationshipTone,
-    CLAUDE_QUOTE_SYSTEM_RULE,
-    CLAUDE_MEMORY_NOTE_RULE,
     '以下是之前真实发生的完整历史聊天记录，请作为连贯记忆完整接住，保持自然语气与设定一致：',
     effectiveHistory,
   ].join('\n\n');
@@ -1148,11 +1143,19 @@ console.log(
   anthropic ? '已启用(claude-opus-4-6)' : '未配置'
 );
 
-// 只在最前面固定核心档案处放 1 个缓存断点，避免后续内容变动频繁失效重写
+// 按变动频率从低到高排布：
+// 1. 核心档案（几乎不变）
+// 2. 关系基调 + 语录/记忆条规则（极少变）
+// 3. 已清理聊天记录（每天只变一次）
+// 4. 心动语录（按需增删改）
+// 在稳定长前缀末尾放 1 个缓存断点，尽量让前面整段在改动前命中缓存；
+// 动态变化的 systemPrompt 放在最后，不打断前面缓存。
 function buildCachedAnthropicPayload(
   coreProfile,
+  relationshipTone,
+  historyBlock,
+  staticRules,
   loveQuotes,
-  memoryPrefix,
   systemPrompt,
   messages,
   model,
@@ -1164,7 +1167,27 @@ function buildCachedAnthropicPayload(
     systemBlocks.push({
       type: 'text',
       text: `【核心档案】\n${coreProfile}`,
-      cache_control: { type: 'ephemeral' },
+    });
+  }
+
+  if (relationshipTone) {
+    systemBlocks.push({
+      type: 'text',
+      text: relationshipTone,
+    });
+  }
+
+  if (staticRules) {
+    systemBlocks.push({
+      type: 'text',
+      text: staticRules,
+    });
+  }
+
+  if (historyBlock) {
+    systemBlocks.push({
+      type: 'text',
+      text: historyBlock,
     });
   }
 
@@ -1175,11 +1198,11 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  if (memoryPrefix) {
-    systemBlocks.push({
-      type: 'text',
-      text: memoryPrefix,
-    });
+  if (systemBlocks.length > 0) {
+    systemBlocks[systemBlocks.length - 1] = {
+      ...systemBlocks[systemBlocks.length - 1],
+      cache_control: { type: 'ephemeral' },
+    };
   }
 
   if (systemPrompt) {
@@ -1449,7 +1472,9 @@ app.post('/api/chat', async (req, res) => {
   const systemPrompt =
     typeof system === 'string' && system.trim() ? system.trim() : '';
   const loveQuotesText = readLoveQuotesText();
-  const memoryPrefix = buildMemoryPrefix(deletedMemories);
+  const relationshipTone = buildRelationshipToneBlock();
+  const historyBlock = buildEffectiveHistoryBlock(deletedMemories);
+  const staticRules = `${CLAUDE_QUOTE_SYSTEM_RULE}\n\n${CLAUDE_MEMORY_NOTE_RULE}`;
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1488,8 +1513,10 @@ app.post('/api/chat', async (req, res) => {
       try {
         const anthropicPayload = buildCachedAnthropicPayload(
           coreProfileText,
+          relationshipTone,
+          historyBlock,
+          staticRules,
           loveQuotesText,
-          memoryPrefix,
           systemPrompt,
           messages,
           targetProxyModel,
@@ -1651,8 +1678,10 @@ app.post('/api/chat', async (req, res) => {
 
       const payload = buildCachedAnthropicPayload(
         coreProfileText,
+        relationshipTone,
+        historyBlock,
+        staticRules,
         loveQuotesText,
-        memoryPrefix,
         systemPrompt,
         messages,
         officialModel,
