@@ -46,15 +46,17 @@ function ensureLoveQuotesFile() {
   return initial;
 }
 
-// 自动将 love-quotes.txt 同步提交到 GitHub 仓库（需在 Render 配置 GITHUB_TOKEN 与 GITHUB_REPO）
+// 自动将仓库文件同步提交到 GitHub 仓库（需在 Render 配置 GITHUB_TOKEN 与 GITHUB_REPO）
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
 const GITHUB_REPO = (process.env.GITHUB_REPO || '').trim();
 const GITHUB_BRANCH = (process.env.GITHUB_BRANCH || 'main').trim();
 const GITHUB_QUOTES_FILE = 'love-quotes.txt';
+const GITHUB_MEMORY_NOTES_FILE = 'memory-notes.json';
 
-async function syncLoveQuotesToGitHub(
+async function syncFileToGitHub(
+  filePathInRepo,
   contentText,
-  commitMessage = 'chore: update love-quotes.txt'
+  commitMessage = 'chore: sync data file'
 ) {
   if (!GITHUB_TOKEN || !GITHUB_REPO) {
     console.warn(
@@ -64,7 +66,7 @@ async function syncLoveQuotesToGitHub(
   }
 
   const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURIComponent(
-    GITHUB_QUOTES_FILE
+    filePathInRepo
   )}`;
   const headers = {
     Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -101,8 +103,27 @@ async function syncLoveQuotesToGitHub(
     throw new Error(`GitHub 同步失败 ${putResp.status}: ${errBody}`);
   }
 
-  console.log(`[github-sync] 已自动同步 ${GITHUB_QUOTES_FILE} 到 ${GITHUB_REPO}`);
+  console.log(`[github-sync] 已自动同步 ${filePathInRepo} 到 ${GITHUB_REPO}`);
   return { synced: true };
+}
+
+async function syncLoveQuotesToGitHub(
+  contentText,
+  commitMessage = 'chore: update love-quotes.txt'
+) {
+  return syncFileToGitHub(GITHUB_QUOTES_FILE, contentText, commitMessage);
+}
+
+async function syncMemoryNotesToGitHub(
+  notesArray,
+  commitMessage = 'chore: update memory-notes.json'
+) {
+  const serialized = JSON.stringify(
+    Array.isArray(notesArray) ? notesArray : [],
+    null,
+    2
+  );
+  return syncFileToGitHub(GITHUB_MEMORY_NOTES_FILE, serialized, commitMessage);
 }
 
 function getTodayMonthDay() {
@@ -461,7 +482,7 @@ function addMemoryNote({ date, tags, content }) {
       duplicate.updatedAt = Date.now();
       writeMemoryNotes(notes);
     }
-    return { ok: true, note: duplicate, duplicated: true };
+    return { ok: true, note: duplicate, duplicated: true, notes };
   }
 
   const newNote = {
@@ -474,7 +495,7 @@ function addMemoryNote({ date, tags, content }) {
   };
   notes.push(newNote);
   writeMemoryNotes(notes);
-  return { ok: true, note: newNote };
+  return { ok: true, note: newNote, notes };
 }
 
 function editMemoryNote({ id, target, newContent, newTags, newDate }) {
@@ -513,7 +534,7 @@ function editMemoryNote({ id, target, newContent, newTags, newDate }) {
   notes[idx].updatedAt = Date.now();
 
   writeMemoryNotes(notes);
-  return { ok: true, note: notes[idx] };
+  return { ok: true, note: notes[idx], notes };
 }
 
 function deleteMemoryNote({ id, target }) {
@@ -539,7 +560,7 @@ function deleteMemoryNote({ id, target }) {
 
   const [removed] = notes.splice(idx, 1);
   writeMemoryNotes(notes);
-  return { ok: true, removed };
+  return { ok: true, removed, notes };
 }
 
 function searchMemoryNotes(queryStr = '', limit = 6) {
@@ -674,9 +695,10 @@ function extractClaudeMemoryActions(rawText = '') {
   return actions;
 }
 
-function runClaudeMemoryActions(actions = []) {
+async function runClaudeMemoryActions(actions = []) {
   if (!Array.isArray(actions) || actions.length === 0) return [];
   const logs = [];
+  let changed = false;
 
   for (const item of actions) {
     if (item.action === 'add') {
@@ -686,6 +708,7 @@ function runClaudeMemoryActions(actions = []) {
         content: item.content,
       });
       if (res.ok) {
+        changed = true;
         logs.push(
           `新增(${res.note.date}) [${(res.note.tags || []).join(',')}]: ${
             res.note.content
@@ -699,6 +722,7 @@ function runClaudeMemoryActions(actions = []) {
         newTags: item.newTags,
       });
       if (res.ok) {
+        changed = true;
         logs.push(`修改: "${item.target}" => "${res.note.content}"`);
       } else {
         console.warn(`[memory-notes] 修改跳过: ${res.error}`);
@@ -706,6 +730,7 @@ function runClaudeMemoryActions(actions = []) {
     } else if (item.action === 'delete') {
       const res = deleteMemoryNote({ target: item.target });
       if (res.ok) {
+        changed = true;
         logs.push(`删除: "${res.removed.content}"`);
       } else {
         console.warn(`[memory-notes] 删除跳过: ${res.error}`);
@@ -713,8 +738,16 @@ function runClaudeMemoryActions(actions = []) {
     }
   }
 
-  if (logs.length > 0) {
+  if (changed && logs.length > 0) {
     console.log('[memory-notes] 克劳德已更新记忆条:', logs.join(' | '));
+    try {
+      await syncMemoryNotesToGitHub(
+        readMemoryNotes(),
+        'chore: claude update memory-notes.json'
+      );
+    } catch (ghErr) {
+      console.error('[github-sync] 同步记忆条报错:', ghErr.message);
+    }
   }
   return logs;
 }
@@ -732,7 +765,7 @@ function stripControlTokens(rawText = '') {
     .trim();
 }
 
-function runClaudeQuoteActions(actions = []) {
+async function runClaudeQuoteActions(actions = []) {
   if (!Array.isArray(actions) || actions.length === 0) return [];
   let currentText = ensureLoveQuotesFile();
   const logs = [];
@@ -786,6 +819,14 @@ function runClaudeQuoteActions(actions = []) {
   if (logs.length > 0) {
     fs.writeFileSync(LOVE_QUOTES_PATH, currentText, 'utf8');
     console.log('[love-quotes] 顾青已更新语录:', logs.join(' | '));
+    try {
+      await syncLoveQuotesToGitHub(
+        currentText,
+        'chore: claude update love-quotes.txt'
+      );
+    } catch (ghErr) {
+      console.error('[github-sync] 同步顾青语录报错:', ghErr.message);
+    }
   }
 
   return logs;
@@ -1311,7 +1352,7 @@ app.get('/api/memory-notes', (req, res) => {
 });
 
 // 记忆条增删改接口（前端弹窗管理 + 克劳德主动搜索/编辑共用）
-app.post('/api/memory-notes', (req, res) => {
+app.post('/api/memory-notes', async (req, res) => {
   const {
     action = 'add',
     id,
@@ -1342,9 +1383,17 @@ app.post('/api/memory-notes', (req, res) => {
       if (!result.ok) {
         return res.status(400).json({ error: result.error });
       }
+      try {
+        await syncMemoryNotesToGitHub(
+          result.notes,
+          'chore: edit memory-notes.json'
+        );
+      } catch (ghErr) {
+        console.error('[github-sync] 同步记忆条报错:', ghErr.message);
+      }
       return res
         .status(200)
-        .json({ ok: true, note: result.note, notes: readMemoryNotes() });
+        .json({ ok: true, note: result.note, notes: result.notes });
     }
 
     if (action === 'delete') {
@@ -1352,18 +1401,34 @@ app.post('/api/memory-notes', (req, res) => {
       if (!result.ok) {
         return res.status(400).json({ error: result.error });
       }
+      try {
+        await syncMemoryNotesToGitHub(
+          result.notes,
+          'chore: delete memory-notes.json'
+        );
+      } catch (ghErr) {
+        console.error('[github-sync] 同步记忆条报错:', ghErr.message);
+      }
       return res
         .status(200)
-        .json({ ok: true, removed: result.removed, notes: readMemoryNotes() });
+        .json({ ok: true, removed: result.removed, notes: result.notes });
     }
 
     const result = addMemoryNote({ date, tags, content });
     if (!result.ok) {
       return res.status(400).json({ error: result.error });
     }
+    try {
+      await syncMemoryNotesToGitHub(
+        result.notes,
+        'chore: add memory-notes.json'
+      );
+    } catch (ghErr) {
+      console.error('[github-sync] 同步记忆条报错:', ghErr.message);
+    }
     return res
       .status(200)
-      .json({ ok: true, note: result.note, notes: readMemoryNotes() });
+      .json({ ok: true, note: result.note, notes: result.notes });
   } catch (err) {
     return res.status(500).json({ error: `操作记忆条失败: ${err.message}` });
   }
@@ -1634,7 +1699,7 @@ app.post('/api/chat', async (req, res) => {
     const claudeQuoteActions = extractClaudeQuoteActions(stationRawOutput);
     if (claudeQuoteActions.length > 0) {
       try {
-        runClaudeQuoteActions(claudeQuoteActions);
+        await runClaudeQuoteActions(claudeQuoteActions);
       } catch (qErr) {
         console.error('[love-quotes] 更新失败:', qErr.message);
       }
@@ -1643,7 +1708,7 @@ app.post('/api/chat', async (req, res) => {
     const claudeMemoryActions = extractClaudeMemoryActions(stationRawOutput);
     if (claudeMemoryActions.length > 0) {
       try {
-        runClaudeMemoryActions(claudeMemoryActions);
+        await runClaudeMemoryActions(claudeMemoryActions);
       } catch (mErr) {
         console.error('[memory-notes] 更新失败:', mErr.message);
       }
