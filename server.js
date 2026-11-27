@@ -6,7 +6,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 // 常驻历史聊天记录截断上限（字符数），控制在缓存安全线内以减少重复写入开销
 const MAX_INLINE_HISTORY_CHARS = 2000;
@@ -1152,6 +1152,81 @@ function extractAnthropicOrProxyText(parsed) {
   return '';
 }
 
+function normalizeMessageContentForAnthropic(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((block) => {
+        if (typeof block === 'string') {
+          return block.trim() ? { type: 'text', text: block } : null;
+        }
+        if (!block || typeof block !== 'object') return null;
+        if (block.type === 'image') {
+          const rawB64 = String(
+            block?.source?.data || block.base64 || ''
+          ).trim();
+          const cleanedB64 = rawB64.replace(
+            /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
+            ''
+          );
+          if (!cleanedB64) return null;
+          return {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type:
+                block?.source?.media_type || block.mediaType || 'image/jpeg',
+              data: cleanedB64,
+            },
+          };
+        }
+        if (block.type === 'text' && typeof block.text === 'string') {
+          return block.text.trim() ? { type: 'text', text: block.text } : null;
+        }
+        return block;
+      })
+      .filter(Boolean);
+  }
+
+  const rawText = typeof msg.content === 'string' ? msg.content : '';
+  const rawImg =
+    msg.image?.base64 ||
+    msg.imageBase64 ||
+    (typeof msg.imageUrl === 'string' ? msg.imageUrl : '') ||
+    '';
+
+  if (rawImg) {
+    const match = String(rawImg).match(
+      /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/
+    );
+    const mediaType =
+      msg.image?.mediaType ||
+      msg.imageMediaType ||
+      (match ? match[1] : 'image/jpeg');
+    const base64Data = (match ? match[2] : String(rawImg)).trim();
+
+    if (base64Data) {
+      const blocks = [
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: mediaType,
+            data: base64Data,
+          },
+        },
+      ];
+      if (rawText.trim()) {
+        blocks.push({ type: 'text', text: rawText.trim() });
+      }
+      return blocks;
+    }
+  }
+
+  return rawText;
+}
+
 // 1. opai（第 1 顺位主站）
 const OPAI_MESSAGES_URL = normalizeAnthropicMessagesUrl(
   process.env.OPAI_BASE_URL,
@@ -1303,9 +1378,17 @@ function buildCachedAnthropicPayload(
     });
   }
 
-  const cleanMessages = messages.filter(
-    (m) => m && (m.role === 'user' || m.role === 'assistant')
-  );
+  const cleanMessages = messages
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
+    .map((m) => ({
+      role: m.role,
+      content: normalizeMessageContentForAnthropic(m),
+    }))
+    .filter((m) =>
+      Array.isArray(m.content)
+        ? m.content.length > 0
+        : Boolean(String(m.content || '').trim())
+    );
 
   const formattedMessages = cleanMessages.map((msg, idx) => {
     if (cleanMessages.length >= 3 && idx === cleanMessages.length - 2) {
